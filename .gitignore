@@ -1,0 +1,49 @@
+# Build directories
+build/
+cmake-build-*/
+CMakeFiles/
+_deps/
+
+# Build artifacts
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.exe
+
+# CMake generated files
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!cmake/*.cmake
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test executables (but not source files)
+test_loop
+test_events
+test_epoll
+test_kqueue
+test_iocp
+
+# Example executables (but not source files)
+examples/simple_server
+examples/timer_example
+
+# Library output
+libpoll_dancer.a
+lib/
+bin/
+
+# OS files
+.DS_Store
+Thumbs.db

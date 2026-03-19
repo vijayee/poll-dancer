@@ -1,0 +1,1 @@
+Create a cross platform c library that creates a unified api for calling kqueue, epoll, and iocp. Make it a cmake module
