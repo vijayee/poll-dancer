@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="unicorn_pole.png" alt="poll-dancer logo" width="200"/>
+  <img src="poll_dancer.png" alt="poll-dancer logo" width="200"/>
 </div>
 
 # poll-dancer
