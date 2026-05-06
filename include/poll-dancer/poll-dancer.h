@@ -223,6 +223,17 @@ pd_error_t pd_timer_destroy(pd_timer_t *timer);
  */
 int pd_loop_async_send(pd_loop_t *loop, void *data);
 
+/**
+ * Retrieve the async data pointer from a loop.
+ * The async data is set by the most recent call to pd_loop_async_send.
+ * This should be called from within the loop thread after the loop
+ * has been woken by an async notification.
+ *
+ * @param loop The loop to get async data from
+ * @return The async data pointer, or NULL if none was set
+ */
+void *pd_loop_get_async_data(pd_loop_t *loop);
+
 #ifdef __cplusplus
 }
 #endif

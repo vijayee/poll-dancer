@@ -62,6 +62,7 @@ pd_loop_t *pd_loop_create(const pd_loop_config_t *config) {
     loop->running = 0;
     loop->stop_requested = 0;
     loop->system_error = 0;
+    loop->async_data = NULL;
 
     /* Initialize mutex if thread-safe */
     if (loop->enable_thread_safety) {
@@ -260,7 +261,32 @@ int pd_loop_async_send(pd_loop_t *loop, void *data) {
         return PD_ERR_NOT_IMPLEMENTED;
     }
 
+    /* Store async data with thread-safe protection */
+    if (loop->enable_thread_safety) {
+        PD_MUTEX_LOCK(loop->mutex);
+    }
+    loop->async_data = data;
+    if (loop->enable_thread_safety) {
+        PD_MUTEX_UNLOCK(loop->mutex);
+    }
+
     return loop->ops->async_send(loop, data);
+}
+
+void *pd_loop_get_async_data(pd_loop_t *loop) {
+    if (!loop) {
+        return NULL;
+    }
+
+    if (loop->enable_thread_safety) {
+        PD_MUTEX_LOCK(loop->mutex);
+    }
+    void *data = loop->async_data;
+    if (loop->enable_thread_safety) {
+        PD_MUTEX_UNLOCK(loop->mutex);
+    }
+
+    return data;
 }
 
 /**

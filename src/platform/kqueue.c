@@ -21,12 +21,21 @@
 #include <sys/time.h>
 
 /**
+ * Unique identifier for the async EVFILT_USER event.
+ * Using the address of this static variable ensures uniqueness across
+ * different kqueue instances and distinguishes async events from
+ * regular watcher events.
+ */
+static const int pd_async_ident;
+
+/**
  * Platform-specific data for kqueue.
  */
 typedef struct {
     int kqueue_fd;                   /**< kqueue file descriptor */
     struct kevent *events;           /**< Event array for kevent */
     int max_events;                  /**< Maximum events per wait */
+    uintptr_t async_ident;           /**< Identifier for the EVFILT_USER async event */
 } pd_kqueue_data_t;
 
 /**
@@ -103,6 +112,21 @@ static int kqueue_loop_create(pd_loop_t *loop, const pd_loop_config_t *config) {
         return PD_ERR_NO_MEMORY;
     }
 
+    /* Set up the async identifier using the address of the static variable */
+    data->async_ident = (uintptr_t)&pd_async_ident;
+
+    /* Register EVFILT_USER event for async wake-up */
+    struct kevent change;
+    EV_SET(&change, data->async_ident, EVFILT_USER,
+           EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
+    if (kevent(data->kqueue_fd, &change, 1, NULL, 0, NULL) < 0) {
+        pd_set_system_error(loop, pd_get_current_system_error());
+        free(data->events);
+        close(data->kqueue_fd);
+        free(data);
+        return PD_ERR_SYSTEM;
+    }
+
     loop->platform_data = data;
     return PD_OK;
 }
@@ -114,7 +138,15 @@ static void kqueue_loop_destroy(pd_loop_t *loop) {
 
     pd_kqueue_data_t *data = (pd_kqueue_data_t *)loop->platform_data;
 
+    /* Delete the EVFILT_USER async event from kqueue.
+     * Closing the kqueue fd will also remove all events, but we do it
+     * explicitly for clarity. */
     if (data->kqueue_fd >= 0) {
+        struct kevent change;
+        EV_SET(&change, data->async_ident, EVFILT_USER, EV_DELETE, 0, 0, NULL);
+        /* Ignore errors - kqueue fd may already be closing */
+        kevent(data->kqueue_fd, &change, 1, NULL, 0, NULL);
+
         close(data->kqueue_fd);
     }
 
@@ -153,6 +185,15 @@ static int kqueue_loop_run(pd_loop_t *loop, int timeout_ms) {
     /* Process events */
     for (int i = 0; i < nfds; i++) {
         struct kevent *event = &data->events[i];
+
+        /* Handle async wake-up (EVFILT_USER with our async identifier) */
+        if (event->filter == EVFILT_USER &&
+            (uintptr_t)event->ident == data->async_ident) {
+            /* The async event has been processed; the loop will check
+             * stop_requested and async_data on the next iteration of
+             * pd_loop_run(). No callback to invoke here. */
+            continue;
+        }
 
         /* Handle timer events specially */
         if (event->filter == EVFILT_TIMER) {
@@ -207,9 +248,9 @@ static int kqueue_loop_run(pd_loop_t *loop, int timeout_ms) {
 }
 
 static int kqueue_loop_stop(pd_loop_t *loop) {
-    /* The generic implementation handles the stop flag.
-     * For kqueue, we could use an EVFILT_USER event to wake up kevent.
-     */
+    /* The generic pd_loop_stop handles setting stop_requested and
+     * calling async_send to wake up kevent via EVFILT_USER.
+     * Nothing else needed here. */
     return PD_OK;
 }
 
@@ -385,13 +426,26 @@ static int kqueue_watcher_unregister(pd_watcher_t *watcher) {
 }
 
 static int kqueue_async_send(pd_loop_t *loop, void *data) {
-    /* For kqueue, we could use EVFILT_USER to wake up kevent.
-     * For simplicity, this implementation doesn't provide async wake-up.
-     * A full implementation would create an EVFILT_USER event on loop creation
-     * and trigger it here.
-     */
     (void)data;
-    return PD_ERR_NOT_IMPLEMENTED;
+
+    if (!loop || !loop->platform_data) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_kqueue_data_t *pdata = (pd_kqueue_data_t *)loop->platform_data;
+
+    /* Trigger the EVFILT_USER event to wake up kevent.
+     * The async_data pointer has already been stored in loop->async_data
+     * by the caller (pd_loop_async_send) before invoking this function. */
+    struct kevent change;
+    EV_SET(&change, pdata->async_ident, EVFILT_USER,
+           0, NOTE_TRIGGER, 0, NULL);
+    if (kevent(pdata->kqueue_fd, &change, 1, NULL, 0, NULL) < 0) {
+        pd_set_system_error(loop, pd_get_current_system_error());
+        return PD_ERR_SYSTEM;
+    }
+
+    return PD_OK;
 }
 
 /* ============================================================================

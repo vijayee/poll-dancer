@@ -40,6 +40,9 @@ struct pd_loop {
 
     /* Thread safety */
     PD_MUTEX_T mutex;              /**< Mutex for thread-safe operations */
+
+    /* Async notification data */
+    void *async_data;              /**< Latest async data pointer */
 };
 
 /**

@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#include <sys/eventfd.h>
 
 /**
  * Platform-specific data for epoll.
@@ -26,6 +27,7 @@ typedef struct {
     int epoll_fd;                    /**< epoll file descriptor */
     struct epoll_event *events;      /**< Event array for epoll_wait */
     int max_events;                  /**< Maximum events per wait */
+    int eventfd_fd;                  /**< eventfd for async wake-up */
 } pd_epoll_data_t;
 
 /**
@@ -145,6 +147,30 @@ static int epoll_loop_create(pd_loop_t *loop, const pd_loop_config_t *config) {
         return PD_ERR_NO_MEMORY;
     }
 
+    /* Create eventfd for async wake-up */
+    data->eventfd_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (data->eventfd_fd < 0) {
+        pd_set_system_error(loop, pd_get_current_system_error());
+        free(data->events);
+        close(data->epoll_fd);
+        free(data);
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Add eventfd to the epoll set with data.ptr = NULL to identify it */
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.ptr = NULL;  /* NULL marks this as the async eventfd */
+    if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->eventfd_fd, &ev) < 0) {
+        pd_set_system_error(loop, pd_get_current_system_error());
+        close(data->eventfd_fd);
+        free(data->events);
+        close(data->epoll_fd);
+        free(data);
+        return PD_ERR_SYSTEM;
+    }
+
     loop->platform_data = data;
     return PD_OK;
 }
@@ -155,6 +181,10 @@ static void epoll_loop_destroy(pd_loop_t *loop) {
     }
 
     pd_epoll_data_t *data = (pd_epoll_data_t *)loop->platform_data;
+
+    if (data->eventfd_fd >= 0) {
+        close(data->eventfd_fd);
+    }
 
     if (data->epoll_fd >= 0) {
         close(data->epoll_fd);
@@ -189,6 +219,20 @@ static int epoll_loop_run(pd_loop_t *loop, int timeout_ms) {
     /* Process events */
     for (int i = 0; i < nfds; i++) {
         struct epoll_event *event = &data->events[i];
+
+        /* Check if this is the async eventfd (identified by data.ptr == NULL) */
+        if (event->data.ptr == NULL) {
+            /* Drain the eventfd counter */
+            uint64_t count;
+            while (read(data->eventfd_fd, &count, sizeof(count)) > 0) {
+                /* Keep reading until EAGAIN (drains all pending notifications) */
+            }
+            /* The async event has been processed; the loop will check
+             * stop_requested and async_data on the next iteration of
+             * pd_loop_run(). No callback to invoke here. */
+            continue;
+        }
+
         pd_watcher_t *watcher = (pd_watcher_t *)event->data.ptr;
 
         if (!watcher || !watcher->callback) {
@@ -204,10 +248,9 @@ static int epoll_loop_run(pd_loop_t *loop, int timeout_ms) {
 }
 
 static int epoll_loop_stop(pd_loop_t *loop) {
-    /* The generic implementation handles the stop flag.
-     * For epoll, we could use eventfd or a pipe to wake up epoll_wait,
-     * but the simpler approach is to just let epoll_wait timeout.
-     */
+    /* The generic pd_loop_stop handles setting stop_requested and
+     * calling async_send to wake up epoll_wait via the eventfd.
+     * Nothing else needed here. */
     return PD_OK;
 }
 
@@ -298,14 +341,29 @@ static int epoll_watcher_unregister(pd_watcher_t *watcher) {
 }
 
 static int epoll_async_send(pd_loop_t *loop, void *data) {
-    /* For epoll, we could use eventfd or a pipe to wake up epoll_wait.
-     * For simplicity, this implementation relies on the stop mechanism
-     * and doesn't provide async wake-up from another thread.
-     * A full implementation would create an eventfd on loop creation and
-     * add it to the epoll set, then write to it here.
-     */
     (void)data;
-    return PD_ERR_NOT_IMPLEMENTED;
+
+    if (!loop || !loop->platform_data) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_epoll_data_t *pdata = (pd_epoll_data_t *)loop->platform_data;
+
+    if (pdata->eventfd_fd < 0) {
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Write to the eventfd to wake up epoll_wait.
+     * The async_data pointer has already been stored in loop->async_data
+     * by the caller (pd_loop_async_send) before invoking this function. */
+    uint64_t count = 1;
+    ssize_t result = write(pdata->eventfd_fd, &count, sizeof(count));
+    if (result < 0 && errno != EAGAIN) {
+        pd_set_system_error(loop, pd_get_current_system_error());
+        return PD_ERR_SYSTEM;
+    }
+
+    return PD_OK;
 }
 
 /* ============================================================================
