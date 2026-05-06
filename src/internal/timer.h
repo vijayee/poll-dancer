@@ -26,6 +26,7 @@ struct pd_timer {
     pd_callback_t callback;     /**< User callback function */
     void *user_data;            /**< User data for callback */
     int active;                 /**< Non-zero if timer is active */
+    int owns_watcher;           /**< Non-zero if timer owns the watcher (epoll); 0 if manually allocated (kqueue/IOCP) */
     void *platform_data;        /**< Platform-specific timer state */
 };
 

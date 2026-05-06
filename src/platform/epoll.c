@@ -371,6 +371,10 @@ static int epoll_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
         return PD_ERR_SYSTEM;
     }
 
+    /* The watcher was created via pd_watcher_create, so the timer owns it
+     * and must call pd_watcher_destroy on cleanup. */
+    timer->owns_watcher = 1;
+
     /* Stop the watcher immediately - it will be started when the timer starts */
     pd_watcher_stop(timer->watcher);
 

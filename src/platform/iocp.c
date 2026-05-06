@@ -393,6 +393,7 @@ static int iocp_async_send(pd_loop_t *loop, void *data) {
 typedef struct {
     HANDLE queue_timer;    /**< Windows timer queue timer handle */
     HANDLE iocp_handle;    /**< IOCP handle for posting completions */
+    HANDLE stop_event;     /**< Event for safe timer stop/destroy synchronization */
     int started;           /**< Non-zero if timer has been started */
 } pd_iocp_timer_data_t;
 
@@ -440,6 +441,17 @@ static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
     timer_data->iocp_handle = data->iocp_handle;
     timer_data->queue_timer = NULL;
     timer_data->started = 0;
+
+    /* Create an event object for safe timer stop/destroy synchronization.
+     * This allows DeleteTimerQueueTimer to signal when pending callbacks
+     * have completed, preventing use-after-free on timer->platform_data. */
+    timer_data->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (timer_data->stop_event == NULL) {
+        pd_set_system_error(loop, GetLastError());
+        free(timer_data);
+        return PD_ERR_SYSTEM;
+    }
+
     timer->platform_data = timer_data;
 
     /* Create a placeholder watcher that is NOT registered with IOCP.
@@ -449,6 +461,7 @@ static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
      * detects a timer completion. */
     pd_watcher_t *watcher = calloc(1, sizeof(pd_watcher_t));
     if (!watcher) {
+        CloseHandle(timer_data->stop_event);
         free(timer_data);
         timer->platform_data = NULL;
         pd_set_system_error(loop, GetLastError());
@@ -463,6 +476,19 @@ static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
     watcher->ref_count = 1;
     watcher->platform_data = NULL;
     timer->watcher = watcher;
+    timer->owns_watcher = 0;  /* Manually allocated, not via pd_watcher_create */
+
+    /* Add watcher to the loop's watcher list so the loop stays alive
+     * when only timers are active (no regular I/O watchers). */
+    int result = pd_loop_add_watcher(loop, watcher);
+    if (result != 0) {
+        free(watcher);
+        CloseHandle(timer_data->stop_event);
+        free(timer_data);
+        timer->platform_data = NULL;
+        timer->watcher = NULL;
+        return result;
+    }
 
     return PD_OK;
 }
@@ -510,19 +536,30 @@ static int iocp_timer_stop(pd_timer_t *timer) {
         return PD_OK;  /* Not started, nothing to do */
     }
 
-    /* Delete the timer queue timer.
-     * Use DeleteTimerQueueTimer with NULL completion event to avoid blocking. */
+    /* Reset the stop event before deleting the timer */
+    ResetEvent(timer_data->stop_event);
+
+    /* Delete the timer queue timer with a completion event.
+     * Using the stop_event allows safe cancellation: the event is signaled
+     * when all pending callbacks have completed, preventing use-after-free
+     * on timer->platform_data. This also allows iocp_timer_stop to be
+     * called from within the timer callback itself safely. */
     BOOL success = DeleteTimerQueueTimer(
         NULL,                     /* Default timer queue */
         timer_data->queue_timer,
-        NULL                      /* No completion event */
+        timer_data->stop_event    /* Signaled when pending callbacks complete */
     );
 
-    /* ERROR_IO_PENDING is expected when the timer is still pending */
+    /* ERROR_IO_PENDING is expected when the timer callback is still running */
     if (!success && GetLastError() != ERROR_IO_PENDING) {
         pd_set_system_error(timer->loop, GetLastError());
         return PD_ERR_SYSTEM;
     }
+
+    /* Wait for the stop event to be signaled (callback has finished).
+     * This ensures no callback is accessing timer->platform_data when we
+     * return. The wait is bounded because the callback will complete. */
+    WaitForSingleObject(timer_data->stop_event, 5000);
 
     timer_data->queue_timer = NULL;
     timer_data->started = 0;
@@ -534,18 +571,32 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
         return;
     }
 
-    /* Stop the timer if running */
+    /* Stop the timer if running, using INVALID_HANDLE_VALUE to wait for
+     * any pending callback to complete before freeing resources. This
+     * prevents use-after-free on timer->platform_data. */
     if (timer->platform_data) {
         pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
         if (timer_data->started && timer_data->queue_timer) {
-            DeleteTimerQueueTimer(NULL, timer_data->queue_timer, NULL);
+            DeleteTimerQueueTimer(NULL, timer_data->queue_timer, INVALID_HANDLE_VALUE);
+            timer_data->queue_timer = NULL;
+            timer_data->started = 0;
+        }
+        /* Close the stop event handle */
+        if (timer_data->stop_event != NULL) {
+            CloseHandle(timer_data->stop_event);
+            timer_data->stop_event = NULL;
         }
         free(timer_data);
         timer->platform_data = NULL;
     }
 
-    /* Free the placeholder watcher (manually allocated, not registered) */
+    /* Remove the placeholder watcher from the loop's watcher list and free it.
+     * This watcher was manually allocated (not via pd_watcher_create), so we
+     * only need to remove it from the list and free it directly. */
     if (timer->watcher) {
+        if (timer->loop) {
+            pd_loop_remove_watcher(timer->loop, timer->watcher);
+        }
         free(timer->watcher);
         timer->watcher = NULL;
     }

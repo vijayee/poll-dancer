@@ -111,8 +111,12 @@ pd_error_t pd_timer_destroy(pd_timer_t *timer) {
         timer->loop->ops->timer_destroy(timer);
     }
 
-    /* Destroy internal watcher if it exists */
-    if (timer->watcher) {
+    /* Destroy internal watcher if it exists and we own it.
+     * On epoll, the watcher was created via pd_watcher_create and should
+     * be destroyed via pd_watcher_destroy. On kqueue/IOCP, the watcher
+     * was manually allocated and already freed by the platform's
+     * timer_destroy function. */
+    if (timer->watcher && timer->owns_watcher) {
         pd_watcher_destroy(timer->watcher);
         timer->watcher = NULL;
     }

@@ -440,6 +440,18 @@ static int kqueue_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
     watcher->ref_count = 1;
     watcher->platform_data = NULL;
     timer->watcher = watcher;
+    timer->owns_watcher = 0;  /* Manually allocated, not via pd_watcher_create */
+
+    /* Add watcher to the loop's watcher list so the loop stays alive
+     * when only timers are active (no regular I/O watchers). */
+    int result = pd_loop_add_watcher(loop, watcher);
+    if (result != 0) {
+        free(watcher);
+        free(timer_data);
+        timer->platform_data = NULL;
+        timer->watcher = NULL;
+        return result;
+    }
 
     return PD_OK;
 }
@@ -468,18 +480,30 @@ static int kqueue_timer_start(pd_timer_t *timer) {
         /* Repeating timer with a different initial delay: start as one-shot
          * with timeout_ms, then reconfigure to repeat at interval_ms when
          * the initial timer fires. */
+        uint64_t timeout = timer->timeout_ms;
+        /* Clamp to minimum of 1ms to avoid kevent data=0 which may cause
+         * undefined behavior on some kqueue implementations. */
+        if (timeout == 0) {
+            timeout = 1;
+        }
         EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER,
                EV_ADD | EV_ENABLE | EV_ONESHOT,
                NOTE_MSECONDS,
-               timer->timeout_ms,
+               timeout,
                timer);
         timer_data->pending_initial = 1;
     } else {
-        /* One-shot timer or repeating timer with same initial delay/interval */
+        /* One-shot timer or repeating timer with same initial delay/interval.
+         * Use interval_ms for repeating timers, timeout_ms for one-shot.
+         * Clamp to minimum of 1ms to avoid kevent data=0. */
+        uint64_t value = timer->interval_ms > 0 ? timer->interval_ms : timer->timeout_ms;
+        if (value == 0) {
+            value = 1;
+        }
         EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER,
                EV_ADD | EV_ENABLE,
                NOTE_MSECONDS,
-               timer->interval_ms > 0 ? timer->interval_ms : timer->timeout_ms,
+               value,
                timer);
         timer_data->pending_initial = 0;
     }
@@ -532,8 +556,13 @@ static void kqueue_timer_destroy(pd_timer_t *timer) {
         timer->platform_data = NULL;
     }
 
-    /* Free the placeholder watcher (manually allocated, not registered) */
+    /* Remove the placeholder watcher from the loop's watcher list and free it.
+     * This watcher was manually allocated (not via pd_watcher_create), so we
+     * only need to remove it from the list and free it directly. */
     if (timer->watcher) {
+        if (timer->loop) {
+            pd_loop_remove_watcher(timer->loop, timer->watcher);
+        }
         free(timer->watcher);
         timer->watcher = NULL;
     }
