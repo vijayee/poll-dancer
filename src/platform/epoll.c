@@ -222,10 +222,14 @@ static int epoll_loop_run(pd_loop_t *loop, int timeout_ms) {
 
         /* Check if this is the async eventfd (identified by data.ptr == NULL) */
         if (event->data.ptr == NULL) {
-            /* Drain the eventfd counter */
+            /* Drain the eventfd counter (single read is sufficient;
+             * eventfd without EFD_SEMAPHORE resets to zero on read) */
             uint64_t count;
-            while (read(data->eventfd_fd, &count, sizeof(count)) > 0) {
-                /* Keep reading until EAGAIN (drains all pending notifications) */
+            ssize_t n = read(data->eventfd_fd, &count, sizeof(count));
+            if (n < 0 && errno != EAGAIN && errno != EINTR) {
+                /* Unexpected read error - not much we can do,
+                 * the loop will still function since the eventfd
+                 * was signaled and we're already processing events */
             }
             /* The async event has been processed; the loop will check
              * stop_requested and async_data on the next iteration of

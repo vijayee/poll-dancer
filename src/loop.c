@@ -216,15 +216,24 @@ int pd_loop_run_once(pd_loop_t *loop, int timeout_ms) {
         return PD_ERR_INVALID_ARG;
     }
 
+    /* Check stop_requested before entering blocking wait */
     if (loop->enable_thread_safety) {
         PD_MUTEX_LOCK(loop->mutex);
     }
-
-    int result = loop->ops->loop_run(loop, timeout_ms);
-
+    int should_stop = loop->stop_requested;
     if (loop->enable_thread_safety) {
         PD_MUTEX_UNLOCK(loop->mutex);
     }
+
+    if (should_stop) {
+        return 0;
+    }
+
+    /* Do NOT hold the mutex during the blocking system call.
+     * epoll_wait/kevent/GetQueuedCompletionStatusEx are thread-safe
+     * and releasing the mutex allows pd_loop_async_send and
+     * pd_loop_stop to proceed from other threads. */
+    int result = loop->ops->loop_run(loop, timeout_ms);
 
     return result;
 }
