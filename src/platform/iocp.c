@@ -29,6 +29,14 @@
 #pragma comment(lib, "mswsock.lib")
 
 /**
+ * Magic completion key for timer completions.
+ * Distinctive value ("TIMR" in ASCII) so timer completions are not
+ * confused with other completion types that happen to have
+ * lpOverlapped == NULL.
+ */
+#define PD_IOCP_TIMER_KEY ((ULONG_PTR)0x54494D52)
+
+/**
  * Platform-specific data for IOCP.
  */
 typedef struct {
@@ -172,14 +180,18 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
     for (ULONG i = 0; i < num_entries; i++) {
         OVERLAPPED_ENTRY *entry = &data->events[i];
 
-        /* Check if this is a timer completion (no overlapped structure) */
-        if (entry->lpOverlapped == NULL && entry->lpCompletionKey != 0) {
-            /* This could be a timer completion or a stop signal */
-            pd_timer_t *timer = (pd_timer_t *)entry->lpCompletionKey;
-            /* Verify this is actually a timer by checking if it has a callback */
+        /* Check if this is a timer completion (identified by magic key) */
+        if (entry->lpCompletionKey == PD_IOCP_TIMER_KEY) {
+            /* Timer pointer was passed via lpOverlapped */
+            pd_timer_t *timer = (pd_timer_t *)entry->lpOverlapped;
             if (timer && timer->callback) {
                 timer->callback(loop, timer->watcher, PD_EVENT_READ, timer->user_data);
             }
+            continue;
+        }
+
+        /* Check for stop signal (completion key 0 with no overlapped) */
+        if (entry->lpOverlapped == NULL && entry->lpCompletionKey == 0) {
             continue;
         }
 
@@ -397,12 +409,14 @@ static VOID CALLBACK iocp_timer_callback(PVOID lpParam, BOOLEAN timer_or_wait_fi
 
     pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
 
-    /* Post a completion packet to IOCP so the user callback runs on the loop thread */
+    /* Post a completion packet to IOCP so the user callback runs on the loop thread.
+     * Use PD_IOCP_TIMER_KEY as the completion key to identify this as a timer
+     * completion, and pass the timer pointer via lpOverlapped (overloaded). */
     PostQueuedCompletionStatus(
         timer_data->iocp_handle,
         0,                        /* Bytes transferred */
-        (ULONG_PTR)timer,         /* Completion key = timer pointer */
-        NULL                      /* No overlapped */
+        PD_IOCP_TIMER_KEY,        /* Completion key = timer magic tag */
+        (OVERLAPPED *)timer       /* Timer pointer as overlapped (overloaded) */
     );
 }
 
@@ -428,16 +442,27 @@ static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
     timer_data->started = 0;
     timer->platform_data = timer_data;
 
-    /* Create a placeholder watcher with fd = -1 */
-    timer->watcher = pd_watcher_create(loop, -1, PD_EVENT_READ, NULL, timer);
-    if (!timer->watcher) {
+    /* Create a placeholder watcher that is NOT registered with IOCP.
+     * IOCP timers post completion packets directly; no real file descriptor
+     * is needed. The watcher exists only as a container for the timer's
+     * callback and user_data that the event loop dispatches to when it
+     * detects a timer completion. */
+    pd_watcher_t *watcher = calloc(1, sizeof(pd_watcher_t));
+    if (!watcher) {
         free(timer_data);
         timer->platform_data = NULL;
-        return PD_ERR_SYSTEM;
+        pd_set_system_error(loop, GetLastError());
+        return PD_ERR_NO_MEMORY;
     }
-
-    /* Stop the watcher immediately */
-    pd_watcher_stop(timer->watcher);
+    watcher->fd = -1;
+    watcher->events = PD_EVENT_NONE;
+    watcher->callback = NULL;
+    watcher->user_data = timer;
+    watcher->loop = loop;
+    watcher->active = 0;
+    watcher->ref_count = 1;
+    watcher->platform_data = NULL;
+    timer->watcher = watcher;
 
     return PD_OK;
 }
@@ -517,6 +542,12 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
         }
         free(timer_data);
         timer->platform_data = NULL;
+    }
+
+    /* Free the placeholder watcher (manually allocated, not registered) */
+    if (timer->watcher) {
+        free(timer->watcher);
+        timer->watcher = NULL;
     }
 }
 

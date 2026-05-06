@@ -158,6 +158,21 @@ static int kqueue_loop_run(pd_loop_t *loop, int timeout_ms) {
         if (event->filter == EVFILT_TIMER) {
             pd_timer_t *timer = (pd_timer_t *)event->udata;
             if (timer && timer->callback) {
+                /* Check if this is the initial one-shot phase of a two-phase
+                 * repeating timer. If so, reconfigure as a repeating timer. */
+                pd_kqueue_timer_data_t *timer_data =
+                    (pd_kqueue_timer_data_t *)timer->platform_data;
+                if (timer_data && timer_data->pending_initial) {
+                    timer_data->pending_initial = 0;
+                    /* Reconfigure as a repeating timer with interval_ms */
+                    struct kevent change;
+                    EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER,
+                           EV_ADD | EV_ENABLE,
+                           NOTE_MSECONDS,
+                           timer->interval_ms,
+                           timer);
+                    kevent(data->kqueue_fd, &change, 1, NULL, 0, NULL);
+                }
                 timer->callback(loop, timer->watcher, PD_EVENT_READ, timer->user_data);
             }
             continue;
@@ -387,7 +402,8 @@ static int kqueue_async_send(pd_loop_t *loop, void *data) {
  * Platform-specific timer data for kqueue timers.
  */
 typedef struct {
-    int registered;  /**< Non-zero if timer kevent is registered with kqueue */
+    int registered;       /**< Non-zero if timer kevent is registered with kqueue */
+    int pending_initial;  /**< Non-zero if initial one-shot phase is active */
 } pd_kqueue_timer_data_t;
 
 static int kqueue_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
@@ -404,20 +420,26 @@ static int kqueue_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
 
     timer->platform_data = timer_data;
 
-    /* Create a placeholder watcher with fd = -1 since kqueue timers
-     * don't use a real file descriptor. The timer pointer itself is
-     * used as the kevent identifier. */
-    timer->watcher = pd_watcher_create(loop, -1, PD_EVENT_READ, NULL, timer);
-    if (!timer->watcher) {
+    /* Create a placeholder watcher that is NOT registered with kqueue.
+     * kqueue timers use EVFILT_TIMER with the timer pointer as the identifier,
+     * so no real file descriptor is needed. The watcher exists only as a
+     * container for the timer's callback and user_data that the event loop
+     * dispatches to when it detects a timer event. */
+    pd_watcher_t *watcher = calloc(1, sizeof(pd_watcher_t));
+    if (!watcher) {
         free(timer_data);
         timer->platform_data = NULL;
-        return PD_ERR_SYSTEM;
+        return PD_ERR_NO_MEMORY;
     }
-
-    /* Stop the watcher immediately - it will be started when the timer starts.
-     * For kqueue timers, the watcher is a placeholder; the real event is
-     * managed through the EVFILT_TIMER kevent. */
-    pd_watcher_stop(timer->watcher);
+    watcher->fd = -1;
+    watcher->events = PD_EVENT_NONE;
+    watcher->callback = NULL;
+    watcher->user_data = timer;
+    watcher->loop = loop;
+    watcher->active = 0;
+    watcher->ref_count = 1;
+    watcher->platform_data = NULL;
+    timer->watcher = watcher;
 
     return PD_OK;
 }
@@ -440,11 +462,27 @@ static int kqueue_timer_start(pd_timer_t *timer) {
     /* Use the timer pointer as the kevent identifier.
      * udata points to the timer so kqueue_loop_run can dispatch correctly. */
     struct kevent change;
-    EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER,
-           EV_ADD | EV_ENABLE,
-           NOTE_MSECONDS,
-           timer->interval_ms > 0 ? timer->interval_ms : timer->timeout_ms,
-           timer);
+
+    if (timer->interval_ms > 0 && timer->timeout_ms != timer->interval_ms &&
+        timer->timeout_ms != 0) {
+        /* Repeating timer with a different initial delay: start as one-shot
+         * with timeout_ms, then reconfigure to repeat at interval_ms when
+         * the initial timer fires. */
+        EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER,
+               EV_ADD | EV_ENABLE | EV_ONESHOT,
+               NOTE_MSECONDS,
+               timer->timeout_ms,
+               timer);
+        timer_data->pending_initial = 1;
+    } else {
+        /* One-shot timer or repeating timer with same initial delay/interval */
+        EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER,
+               EV_ADD | EV_ENABLE,
+               NOTE_MSECONDS,
+               timer->interval_ms > 0 ? timer->interval_ms : timer->timeout_ms,
+               timer);
+        timer_data->pending_initial = 0;
+    }
 
     int result = kevent(data->kqueue_fd, &change, 1, NULL, 0, NULL);
     if (result < 0) {
@@ -479,6 +517,7 @@ static int kqueue_timer_stop(pd_timer_t *timer) {
     kevent(data->kqueue_fd, &change, 1, NULL, 0, NULL);
 
     timer_data->registered = 0;
+    timer_data->pending_initial = 0;
     return PD_OK;
 }
 
@@ -491,5 +530,11 @@ static void kqueue_timer_destroy(pd_timer_t *timer) {
     if (timer->platform_data) {
         free(timer->platform_data);
         timer->platform_data = NULL;
+    }
+
+    /* Free the placeholder watcher (manually allocated, not registered) */
+    if (timer->watcher) {
+        free(timer->watcher);
+        timer->watcher = NULL;
     }
 }

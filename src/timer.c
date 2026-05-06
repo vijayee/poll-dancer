@@ -16,21 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/**
- * Internal callback that bridges the timer watcher to the user's callback.
- * When the timer's internal watcher fires, this invokes the user's callback
- * with the timer's user_data.
- */
-static void timer_watcher_callback(pd_loop_t *loop, pd_watcher_t *watcher,
-                                   pd_event_t events, void *user_data) {
-    (void)watcher;
-    pd_timer_t *timer = (pd_timer_t *)user_data;
-    if (!timer || !timer->callback) {
-        return;
-    }
-    timer->callback(loop, timer->watcher, events, timer->user_data);
-}
-
 pd_timer_t *pd_timer_create(pd_loop_t *loop, uint64_t timeout_ms,
                             uint64_t interval_ms, pd_callback_t callback,
                             void *user_data) {
