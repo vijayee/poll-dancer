@@ -6,8 +6,10 @@
  */
 
 #include "internal/platform.h"
+#include "poll-dancer/poll-dancer.h"
 #include "internal/loop.h"
 #include "internal/watcher.h"
+#include "internal/timer.h"
 #include "internal/internal.h"
 
 #include <stdlib.h>
@@ -15,6 +17,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 
 /**
  * Platform-specific data for epoll.
@@ -41,6 +44,10 @@ static int epoll_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher);
 static int epoll_watcher_update(pd_watcher_t *watcher, pd_event_t events);
 static int epoll_watcher_unregister(pd_watcher_t *watcher);
 static int epoll_async_send(pd_loop_t *loop, void *data);
+static int epoll_timer_create(pd_loop_t *loop, pd_timer_t *timer);
+static int epoll_timer_start(pd_timer_t *timer);
+static int epoll_timer_stop(pd_timer_t *timer);
+static void epoll_timer_destroy(pd_timer_t *timer);
 
 /* Platform operations */
 const pd_platform_ops_t pd_platform_epoll = {
@@ -52,6 +59,10 @@ const pd_platform_ops_t pd_platform_epoll = {
     .watcher_update = epoll_watcher_update,
     .watcher_unregister = epoll_watcher_unregister,
     .async_send = epoll_async_send,
+    .timer_create = epoll_timer_create,
+    .timer_start = epoll_timer_start,
+    .timer_stop = epoll_timer_stop,
+    .timer_destroy = epoll_timer_destroy,
     .name = "epoll",
     .max_events = 1024,
 };
@@ -295,4 +306,166 @@ static int epoll_async_send(pd_loop_t *loop, void *data) {
      */
     (void)data;
     return PD_ERR_NOT_IMPLEMENTED;
+}
+
+/* ============================================================================
+ * Timer implementation using timerfd
+ * ============================================================================ */
+
+/**
+ * Internal callback for timerfd watcher.
+ * Reads the timerfd to acknowledge the firing, then invokes user callback.
+ */
+static void timerfd_callback(pd_loop_t *loop, pd_watcher_t *watcher,
+                             pd_event_t events, void *user_data) {
+    (void)events;
+    pd_timer_t *timer = (pd_timer_t *)user_data;
+    if (!timer) {
+        return;
+    }
+
+    /* Read the timerfd to acknowledge the event */
+    int timerfd = watcher->fd;
+    if (timerfd >= 0) {
+        uint64_t expirations;
+        ssize_t n = read(timerfd, &expirations, sizeof(expirations));
+        (void)n;  /* Ignore read errors, timer still fires */
+    }
+
+    /* Invoke the user callback */
+    if (timer->callback) {
+        timer->callback(loop, watcher, PD_EVENT_READ, timer->user_data);
+    }
+}
+
+static int epoll_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
+    if (!loop || !timer) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    /* Create a timerfd */
+    int timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (timerfd < 0) {
+        pd_set_system_error(loop, pd_get_current_system_error());
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Store the timerfd as platform data */
+    int *timerfd_ptr = calloc(1, sizeof(int));
+    if (!timerfd_ptr) {
+        close(timerfd);
+        return PD_ERR_NO_MEMORY;
+    }
+    *timerfd_ptr = timerfd;
+    timer->platform_data = timerfd_ptr;
+
+    /* Create an internal watcher for the timerfd.
+     * The watcher's user_data points back to the timer so the callback
+     * can bridge to the user's callback. */
+    timer->watcher = pd_watcher_create(loop, timerfd, PD_EVENT_READ,
+                                        timerfd_callback, timer);
+    if (!timer->watcher) {
+        close(timerfd);
+        free(timerfd_ptr);
+        timer->platform_data = NULL;
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Stop the watcher immediately - it will be started when the timer starts */
+    pd_watcher_stop(timer->watcher);
+
+    return PD_OK;
+}
+
+static int epoll_timer_start(pd_timer_t *timer) {
+    if (!timer || !timer->loop) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    int timerfd = *(int *)timer->platform_data;
+    if (timerfd < 0) {
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Convert timeout and interval to itimerspec */
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+
+    if (timer->timeout_ms > 0) {
+        its.it_value.tv_sec = timer->timeout_ms / 1000;
+        its.it_value.tv_nsec = (timer->timeout_ms % 1000) * 1000000;
+    } else if (timer->timeout_ms == 0) {
+        /* Fire immediately: set to smallest non-zero value */
+        its.it_value.tv_sec = 0;
+        its.it_value.tv_nsec = 1;
+    }
+
+    if (timer->interval_ms > 0) {
+        its.it_interval.tv_sec = timer->interval_ms / 1000;
+        its.it_interval.tv_nsec = (timer->interval_ms % 1000) * 1000000;
+    }
+    /* If interval_ms == 0, it_interval is all zeros = one-shot */
+
+    /* Arm the timer */
+    int result = timerfd_settime(timerfd, 0, &its, NULL);
+    if (result < 0) {
+        pd_set_system_error(timer->loop, pd_get_current_system_error());
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Start the watcher */
+    if (timer->watcher) {
+        result = pd_watcher_start(timer->watcher);
+        if (result != 0) {
+            return result;
+        }
+    }
+
+    return PD_OK;
+}
+
+static int epoll_timer_stop(pd_timer_t *timer) {
+    if (!timer || !timer->loop) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    int timerfd = *(int *)timer->platform_data;
+    if (timerfd < 0) {
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Disarm the timer */
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    int result = timerfd_settime(timerfd, 0, &its, NULL);
+    if (result < 0) {
+        pd_set_system_error(timer->loop, pd_get_current_system_error());
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Stop the watcher */
+    if (timer->watcher) {
+        result = pd_watcher_stop(timer->watcher);
+        if (result != 0) {
+            return result;
+        }
+    }
+
+    return PD_OK;
+}
+
+static void epoll_timer_destroy(pd_timer_t *timer) {
+    if (!timer) {
+        return;
+    }
+
+    /* Close the timerfd */
+    if (timer->platform_data) {
+        int *timerfd_ptr = (int *)timer->platform_data;
+        if (*timerfd_ptr >= 0) {
+            close(*timerfd_ptr);
+        }
+        free(timerfd_ptr);
+        timer->platform_data = NULL;
+    }
 }

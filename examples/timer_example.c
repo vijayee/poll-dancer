@@ -2,14 +2,13 @@
  * poll-dancer - Cross-platform event loop library
  * Copyright (C) 2026
  *
- * Timer example using socketpair for async notification.
+ * Timer example using the pd_timer API.
  */
 
 #include "poll-dancer/poll-dancer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <signal.h>
 
 #ifdef _WIN32
@@ -17,9 +16,6 @@
     #pragma comment(lib, "ws2_32.lib")
 #else
     #include <unistd.h>
-    #include <sys/socket.h>
-    #define closesocket close
-    #define SOCKET int
 #endif
 
 /* Global variables for signal handling */
@@ -29,6 +25,8 @@ static volatile int g_running = 1;
 /* Timer callback */
 static void timer_callback(pd_loop_t *loop, pd_watcher_t *watcher,
                           pd_event_t events, void *user_data) {
+    (void)watcher;
+    (void)events;
     int *count = (int *)user_data;
     printf("Timer fired! Count: %d\n", *count);
 
@@ -77,58 +75,35 @@ int main(void) {
     signal(SIGTERM, signal_handler);
 #endif
 
-    /* Create a timer using a socket pair */
-    /* Note: This is a simplified example. A real implementation would use
-     * platform-specific timer mechanisms like timerfd on Linux or
-     * dispatch timers on macOS */
-    int fds[2];
-#ifdef _WIN32
-    /* On Windows, you'd use a different mechanism */
-    /* For simplicity, we'll just demonstrate the loop structure */
-    printf("Timer example: Running event loop\n");
-    printf("Note: Real timers require platform-specific implementation\n");
-#else
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) < 0) {
-        perror("socketpair");
-        pd_loop_destroy(loop);
-        return 1;
-    }
-#endif
-
     int timer_count = 0;
 
-#ifndef _WIN32
-    /* Create watcher for timer socket */
-    pd_watcher_t *watcher = pd_watcher_create(loop, fds[0], PD_EVENT_READ,
-                                             timer_callback, &timer_count);
-    if (!watcher) {
-        fprintf(stderr, "Failed to create watcher\n");
-        closesocket(fds[0]);
-        closesocket(fds[1]);
+    /* Create a repeating timer: first fire at 1000ms, then every 1000ms */
+    pd_timer_t *timer = pd_timer_create(loop, 1000, 1000,
+                                         timer_callback, &timer_count);
+    if (!timer) {
+        fprintf(stderr, "Failed to create timer\n");
         pd_loop_destroy(loop);
         return 1;
     }
 
-    /* Simulate timer by writing to the socket periodically */
-    /* In a real application, you'd use a proper timer mechanism */
-    printf("Timer example started\n");
-    printf("This example demonstrates event loop structure\n");
-    printf("Press Ctrl+C to stop\n");
+    /* Start the timer */
+    pd_error_t err = pd_timer_start(timer);
+    if (err != PD_OK) {
+        fprintf(stderr, "Failed to start timer: %s\n", pd_error_string(err));
+        pd_timer_destroy(timer);
+        pd_loop_destroy(loop);
+        return 1;
+    }
 
-    /* For demonstration, we'll just run the loop */
-    /* A real timer implementation would write to fds[1] periodically */
-#endif
+    printf("Timer example started\n");
+    printf("Timer fires every 1000ms, stops after 5 events\n");
+    printf("Press Ctrl+C to stop\n");
 
     /* Run event loop */
     pd_loop_run(loop);
 
     /* Cleanup */
-#ifndef _WIN32
-    pd_watcher_destroy(watcher);
-    closesocket(fds[0]);
-    closesocket(fds[1]);
-#endif
-
+    pd_timer_destroy(timer);
     pd_loop_destroy(loop);
 
 #ifdef _WIN32

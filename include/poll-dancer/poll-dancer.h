@@ -165,6 +165,51 @@ int pd_watcher_get_fd(pd_watcher_t *watcher);
 pd_event_t pd_watcher_get_events(pd_watcher_t *watcher);
 
 /* ============================================================================
+ * Timer Management
+ * ============================================================================ */
+
+/**
+ * Create a new timer.
+ *
+ * @param loop The loop to attach the timer to
+ * @param timeout_ms Initial delay before first firing (0 = fire immediately)
+ * @param interval_ms Repeat interval (0 = one-shot timer)
+ * @param callback The callback to invoke when the timer fires
+ * @param user_data User data to pass to the callback
+ * @return A new timer handle, or NULL on error
+ */
+pd_timer_t *pd_timer_create(pd_loop_t *loop, uint64_t timeout_ms,
+                            uint64_t interval_ms, pd_callback_t callback,
+                            void *user_data);
+
+/**
+ * Start a timer.
+ * The timer begins counting from when this is called.
+ *
+ * @param timer The timer to start
+ * @return 0 on success, negative error code on failure
+ */
+pd_error_t pd_timer_start(pd_timer_t *timer);
+
+/**
+ * Stop a timer.
+ * The timer stops firing but remains allocated.
+ *
+ * @param timer The timer to stop
+ * @return 0 on success, negative error code on failure
+ */
+pd_error_t pd_timer_stop(pd_timer_t *timer);
+
+/**
+ * Destroy a timer.
+ * The timer handle becomes invalid after this call.
+ *
+ * @param timer The timer to destroy
+ * @return 0 on success, negative error code on failure
+ */
+pd_error_t pd_timer_destroy(pd_timer_t *timer);
+
+/* ============================================================================
  * Async Operations
  * ============================================================================ */
 

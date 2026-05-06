@@ -9,6 +9,10 @@ add_executable(test_events test_events.cpp)
 set_target_properties(test_events PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
 target_link_libraries(test_events poll_dancer gtest_main)
 
+add_executable(test_timer test_timer.cpp)
+set_target_properties(test_timer PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
+target_link_libraries(test_timer poll_dancer gtest_main)
+
 # Platform-specific tests
 if(POLL_DANCER_PLATFORM STREQUAL "linux")
     add_executable(test_epoll platform/test_epoll.cpp)
@@ -29,6 +33,7 @@ include(GoogleTest)
 
 gtest_discover_tests(test_loop)
 gtest_discover_tests(test_events)
+gtest_discover_tests(test_timer)
 
 if(POLL_DANCER_PLATFORM STREQUAL "linux")
     gtest_discover_tests(test_epoll)

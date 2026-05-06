@@ -15,6 +15,7 @@
 /* Forward declarations */
 struct pd_loop;
 struct pd_watcher;
+struct pd_timer;
 
 /**
  * Platform-specific operations.
@@ -34,6 +35,12 @@ typedef struct pd_platform_ops {
 
     /* Async operations */
     int (*async_send)(struct pd_loop *loop, void *data);
+
+    /* Timer operations */
+    int (*timer_create)(struct pd_loop *loop, struct pd_timer *timer);
+    int (*timer_start)(struct pd_timer *timer);
+    int (*timer_stop)(struct pd_timer *timer);
+    void (*timer_destroy)(struct pd_timer *timer);
 
     /* Platform info */
     const char *name;       /**< Platform name (e.g., "epoll", "kqueue", "iocp") */

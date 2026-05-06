@@ -49,6 +49,7 @@ endif()
 set(POLL_DANCER_SOURCES
     src/loop.c
     src/watcher.c
+    src/timer.c
     src/error.c
     src/init.c
     src/platform.c

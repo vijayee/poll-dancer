@@ -10,8 +10,10 @@
  */
 
 #include "internal/platform.h"
+#include "poll-dancer/poll-dancer.h"
 #include "internal/loop.h"
 #include "internal/watcher.h"
+#include "internal/timer.h"
 #include "internal/internal.h"
 
 #ifdef PD_PLATFORM_WINDOWS
@@ -55,6 +57,10 @@ static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher);
 static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events);
 static int iocp_watcher_unregister(pd_watcher_t *watcher);
 static int iocp_async_send(pd_loop_t *loop, void *data);
+static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer);
+static int iocp_timer_start(pd_timer_t *timer);
+static int iocp_timer_stop(pd_timer_t *timer);
+static void iocp_timer_destroy(pd_timer_t *timer);
 
 /* Platform operations */
 const pd_platform_ops_t pd_platform_iocp = {
@@ -66,6 +72,10 @@ const pd_platform_ops_t pd_platform_iocp = {
     .watcher_update = iocp_watcher_update,
     .watcher_unregister = iocp_watcher_unregister,
     .async_send = iocp_async_send,
+    .timer_create = iocp_timer_create,
+    .timer_start = iocp_timer_start,
+    .timer_stop = iocp_timer_stop,
+    .timer_destroy = iocp_timer_destroy,
     .name = "iocp",
     .max_events = 1024,
 };
@@ -161,6 +171,18 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
     /* Process completion packets */
     for (ULONG i = 0; i < num_entries; i++) {
         OVERLAPPED_ENTRY *entry = &data->events[i];
+
+        /* Check if this is a timer completion (no overlapped structure) */
+        if (entry->lpOverlapped == NULL && entry->lpCompletionKey != 0) {
+            /* This could be a timer completion or a stop signal */
+            pd_timer_t *timer = (pd_timer_t *)entry->lpCompletionKey;
+            /* Verify this is actually a timer by checking if it has a callback */
+            if (timer && timer->callback) {
+                timer->callback(loop, timer->watcher, PD_EVENT_READ, timer->user_data);
+            }
+            continue;
+        }
+
         pd_watcher_t *watcher = (pd_watcher_t *)entry->lpCompletionKey;
 
         if (!watcher || !watcher->callback) {
@@ -349,6 +371,155 @@ static int iocp_async_send(pd_loop_t *loop, void *data) {
     return iocp_loop_stop(loop);
 }
 
+/* ============================================================================
+ * Timer implementation using CreateTimerQueueTimer
+ * ============================================================================ */
+
+/**
+ * Platform-specific timer data for IOCP timers.
+ */
+typedef struct {
+    HANDLE queue_timer;    /**< Windows timer queue timer handle */
+    HANDLE iocp_handle;    /**< IOCP handle for posting completions */
+    int started;           /**< Non-zero if timer has been started */
+} pd_iocp_timer_data_t;
+
+/**
+ * Windows timer callback. Runs on a thread pool thread.
+ * Posts a completion to IOCP so the user callback runs on the loop thread.
+ */
+static VOID CALLBACK iocp_timer_callback(PVOID lpParam, BOOLEAN timer_or_wait_fired) {
+    (void)timer_or_wait_fired;
+    pd_timer_t *timer = (pd_timer_t *)lpParam;
+    if (!timer || !timer->platform_data) {
+        return;
+    }
+
+    pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
+
+    /* Post a completion packet to IOCP so the user callback runs on the loop thread */
+    PostQueuedCompletionStatus(
+        timer_data->iocp_handle,
+        0,                        /* Bytes transferred */
+        (ULONG_PTR)timer,         /* Completion key = timer pointer */
+        NULL                      /* No overlapped */
+    );
+}
+
+static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
+    if (!loop || !timer) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_iocp_data_t *data = (pd_iocp_data_t *)loop->platform_data;
+    if (!data) {
+        return PD_ERR_LOOP_CLOSED;
+    }
+
+    /* Allocate platform data */
+    pd_iocp_timer_data_t *timer_data = calloc(1, sizeof(pd_iocp_timer_data_t));
+    if (!timer_data) {
+        pd_set_system_error(loop, GetLastError());
+        return PD_ERR_NO_MEMORY;
+    }
+
+    timer_data->iocp_handle = data->iocp_handle;
+    timer_data->queue_timer = NULL;
+    timer_data->started = 0;
+    timer->platform_data = timer_data;
+
+    /* Create a placeholder watcher with fd = -1 */
+    timer->watcher = pd_watcher_create(loop, -1, PD_EVENT_READ, NULL, timer);
+    if (!timer->watcher) {
+        free(timer_data);
+        timer->platform_data = NULL;
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Stop the watcher immediately */
+    pd_watcher_stop(timer->watcher);
+
+    return PD_OK;
+}
+
+static int iocp_timer_start(pd_timer_t *timer) {
+    if (!timer || !timer->loop) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
+    if (!timer_data) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    /* Create the timer queue timer */
+    DWORD due_time = (DWORD)timer->timeout_ms;
+    DWORD period = (DWORD)timer->interval_ms;
+
+    BOOL success = CreateTimerQueueTimer(
+        &timer_data->queue_timer,
+        NULL,                     /* Default timer queue */
+        iocp_timer_callback,      /* Callback */
+        timer,                    /* Parameter */
+        due_time,                 /* Initial delay */
+        period,                   /* Period (0 = one-shot) */
+        WT_EXECUTEINTIMERTHREAD   /* Execute in timer thread for low latency */
+    );
+
+    if (!success) {
+        pd_set_system_error(timer->loop, GetLastError());
+        return PD_ERR_SYSTEM;
+    }
+
+    timer_data->started = 1;
+    return PD_OK;
+}
+
+static int iocp_timer_stop(pd_timer_t *timer) {
+    if (!timer || !timer->loop) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
+    if (!timer_data || !timer_data->started) {
+        return PD_OK;  /* Not started, nothing to do */
+    }
+
+    /* Delete the timer queue timer.
+     * Use DeleteTimerQueueTimer with NULL completion event to avoid blocking. */
+    BOOL success = DeleteTimerQueueTimer(
+        NULL,                     /* Default timer queue */
+        timer_data->queue_timer,
+        NULL                      /* No completion event */
+    );
+
+    /* ERROR_IO_PENDING is expected when the timer is still pending */
+    if (!success && GetLastError() != ERROR_IO_PENDING) {
+        pd_set_system_error(timer->loop, GetLastError());
+        return PD_ERR_SYSTEM;
+    }
+
+    timer_data->queue_timer = NULL;
+    timer_data->started = 0;
+    return PD_OK;
+}
+
+static void iocp_timer_destroy(pd_timer_t *timer) {
+    if (!timer) {
+        return;
+    }
+
+    /* Stop the timer if running */
+    if (timer->platform_data) {
+        pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
+        if (timer_data->started && timer_data->queue_timer) {
+            DeleteTimerQueueTimer(NULL, timer_data->queue_timer, NULL);
+        }
+        free(timer_data);
+        timer->platform_data = NULL;
+    }
+}
+
 #else /* !PD_PLATFORM_WINDOWS */
 
 /* Stub implementation for non-Windows platforms */
@@ -361,6 +532,10 @@ const pd_platform_ops_t pd_platform_iocp = {
     .watcher_update = NULL,
     .watcher_unregister = NULL,
     .async_send = NULL,
+    .timer_create = NULL,
+    .timer_start = NULL,
+    .timer_stop = NULL,
+    .timer_destroy = NULL,
     .name = "iocp",
     .max_events = 0,
 };

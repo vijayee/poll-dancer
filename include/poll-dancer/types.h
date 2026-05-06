@@ -28,6 +28,12 @@ typedef struct pd_loop pd_loop_t;
 typedef struct pd_watcher pd_watcher_t;
 
 /**
+ * Opaque handle to a timer.
+ * A timer fires a callback after a specified timeout, optionally repeating.
+ */
+typedef struct pd_timer pd_timer_t;
+
+/**
  * Error codes returned by library functions.
  * Negative values indicate errors, 0 indicates success.
  */

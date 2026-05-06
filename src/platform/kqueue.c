@@ -6,8 +6,10 @@
  */
 
 #include "internal/platform.h"
+#include "poll-dancer/poll-dancer.h"
 #include "internal/loop.h"
 #include "internal/watcher.h"
+#include "internal/timer.h"
 #include "internal/internal.h"
 
 #include <stdlib.h>
@@ -44,6 +46,10 @@ static int kqueue_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher);
 static int kqueue_watcher_update(pd_watcher_t *watcher, pd_event_t events);
 static int kqueue_watcher_unregister(pd_watcher_t *watcher);
 static int kqueue_async_send(pd_loop_t *loop, void *data);
+static int kqueue_timer_create(pd_loop_t *loop, pd_timer_t *timer);
+static int kqueue_timer_start(pd_timer_t *timer);
+static int kqueue_timer_stop(pd_timer_t *timer);
+static void kqueue_timer_destroy(pd_timer_t *timer);
 
 /* Platform operations */
 const pd_platform_ops_t pd_platform_kqueue = {
@@ -55,6 +61,10 @@ const pd_platform_ops_t pd_platform_kqueue = {
     .watcher_update = kqueue_watcher_update,
     .watcher_unregister = kqueue_watcher_unregister,
     .async_send = kqueue_async_send,
+    .timer_create = kqueue_timer_create,
+    .timer_start = kqueue_timer_start,
+    .timer_stop = kqueue_timer_stop,
+    .timer_destroy = kqueue_timer_destroy,
     .name = "kqueue",
     .max_events = 1024,
 };
@@ -143,6 +153,16 @@ static int kqueue_loop_run(pd_loop_t *loop, int timeout_ms) {
     /* Process events */
     for (int i = 0; i < nfds; i++) {
         struct kevent *event = &data->events[i];
+
+        /* Handle timer events specially */
+        if (event->filter == EVFILT_TIMER) {
+            pd_timer_t *timer = (pd_timer_t *)event->udata;
+            if (timer && timer->callback) {
+                timer->callback(loop, timer->watcher, PD_EVENT_READ, timer->user_data);
+            }
+            continue;
+        }
+
         pd_watcher_t *watcher = (pd_watcher_t *)event->udata;
 
         if (!watcher || !watcher->callback) {
@@ -357,4 +377,119 @@ static int kqueue_async_send(pd_loop_t *loop, void *data) {
      */
     (void)data;
     return PD_ERR_NOT_IMPLEMENTED;
+}
+
+/* ============================================================================
+ * Timer implementation using EVFILT_TIMER
+ * ============================================================================ */
+
+/**
+ * Platform-specific timer data for kqueue timers.
+ */
+typedef struct {
+    int registered;  /**< Non-zero if timer kevent is registered with kqueue */
+} pd_kqueue_timer_data_t;
+
+static int kqueue_timer_create(pd_loop_t *loop, pd_timer_t *timer) {
+    if (!loop || !timer) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    /* Allocate platform data */
+    pd_kqueue_timer_data_t *timer_data = calloc(1, sizeof(pd_kqueue_timer_data_t));
+    if (!timer_data) {
+        pd_set_system_error(loop, pd_get_current_system_error());
+        return PD_ERR_NO_MEMORY;
+    }
+
+    timer->platform_data = timer_data;
+
+    /* Create a placeholder watcher with fd = -1 since kqueue timers
+     * don't use a real file descriptor. The timer pointer itself is
+     * used as the kevent identifier. */
+    timer->watcher = pd_watcher_create(loop, -1, PD_EVENT_READ, NULL, timer);
+    if (!timer->watcher) {
+        free(timer_data);
+        timer->platform_data = NULL;
+        return PD_ERR_SYSTEM;
+    }
+
+    /* Stop the watcher immediately - it will be started when the timer starts.
+     * For kqueue timers, the watcher is a placeholder; the real event is
+     * managed through the EVFILT_TIMER kevent. */
+    pd_watcher_stop(timer->watcher);
+
+    return PD_OK;
+}
+
+static int kqueue_timer_start(pd_timer_t *timer) {
+    if (!timer || !timer->loop) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_kqueue_data_t *data = (pd_kqueue_data_t *)timer->loop->platform_data;
+    if (!data) {
+        return PD_ERR_LOOP_CLOSED;
+    }
+
+    pd_kqueue_timer_data_t *timer_data = (pd_kqueue_timer_data_t *)timer->platform_data;
+    if (!timer_data) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    /* Use the timer pointer as the kevent identifier.
+     * udata points to the timer so kqueue_loop_run can dispatch correctly. */
+    struct kevent change;
+    EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER,
+           EV_ADD | EV_ENABLE,
+           NOTE_MSECONDS,
+           timer->interval_ms > 0 ? timer->interval_ms : timer->timeout_ms,
+           timer);
+
+    int result = kevent(data->kqueue_fd, &change, 1, NULL, 0, NULL);
+    if (result < 0) {
+        pd_set_system_error(timer->loop, pd_get_current_system_error());
+        return PD_ERR_SYSTEM;
+    }
+
+    timer_data->registered = 1;
+    return PD_OK;
+}
+
+static int kqueue_timer_stop(pd_timer_t *timer) {
+    if (!timer || !timer->loop) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_kqueue_data_t *data = (pd_kqueue_data_t *)timer->loop->platform_data;
+    if (!data) {
+        return PD_ERR_LOOP_CLOSED;
+    }
+
+    pd_kqueue_timer_data_t *timer_data = (pd_kqueue_timer_data_t *)timer->platform_data;
+    if (!timer_data || !timer_data->registered) {
+        return PD_OK;  /* Not registered, nothing to do */
+    }
+
+    /* Delete the EVFILT_TIMER kevent */
+    struct kevent change;
+    EV_SET(&change, (uintptr_t)timer, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+
+    /* Ignore errors - timer may have already been deleted */
+    kevent(data->kqueue_fd, &change, 1, NULL, 0, NULL);
+
+    timer_data->registered = 0;
+    return PD_OK;
+}
+
+static void kqueue_timer_destroy(pd_timer_t *timer) {
+    if (!timer) {
+        return;
+    }
+
+    /* Free platform data */
+    if (timer->platform_data) {
+        free(timer->platform_data);
+        timer->platform_data = NULL;
+    }
 }
