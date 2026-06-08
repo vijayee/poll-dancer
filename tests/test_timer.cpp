@@ -252,3 +252,120 @@ TEST(TimerTest, ImmediateTimeout) {
     pd_timer_destroy(timer);
     pd_loop_destroy(loop);
 }
+
+/* Test: Repeatedly create and destroy many timers on the same loop.
+ * This is the pattern that exposes the use-after-close bug in
+ * pd_timer_destroy: after timerfd is closed, pd_watcher_destroy calls
+ * epoll_ctl(EPOLL_CTL_DEL) on the now-closed fd. The fd may have been
+ * recycled to a different (live) epoll-tracked fd, causing kernel state
+ * corruption. */
+TEST(TimerTest, RepeatedCreateDestroy) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    timer_test_data_t test_data = {0, loop};
+
+    for (int i = 0; i < 200; i++) {
+        pd_timer_t *timer = pd_timer_create(loop, 1000, 0,
+                                             timer_test_callback, &test_data);
+        ASSERT_NE(timer, nullptr);
+        pd_error_t err = pd_timer_destroy(timer);
+        EXPECT_EQ(err, PD_OK);
+    }
+
+    pd_loop_destroy(loop);
+}
+
+/* Test: Create, start, stop, destroy many timers in sequence. Mirrors
+ * the real-world usage pattern in timer_actor where each test fixture
+ * creates timers that get stopped and destroyed during teardown. */
+TEST(TimerTest, RepeatedStartStopDestroy) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    timer_test_data_t test_data = {0, loop};
+
+    for (int i = 0; i < 200; i++) {
+        pd_timer_t *timer = pd_timer_create(loop, 1000, 100,
+                                             timer_test_callback, &test_data);
+        ASSERT_NE(timer, nullptr);
+        pd_error_t err = pd_timer_start(timer);
+        EXPECT_EQ(err, PD_OK);
+        err = pd_timer_stop(timer);
+        EXPECT_EQ(err, PD_OK);
+        err = pd_timer_destroy(timer);
+        EXPECT_EQ(err, PD_OK);
+    }
+
+    pd_loop_destroy(loop);
+}
+
+/* Test: Create many live timers, then destroy them all. Forces fd reuse
+ * while other live timers still hold their timerfds. */
+TEST(TimerTest, ManyTimersThenDestroy) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    timer_test_data_t test_data = {0, loop};
+    constexpr int N = 50;
+    pd_timer_t *timers[N];
+
+    for (int i = 0; i < N; i++) {
+        timers[i] = pd_timer_create(loop, 1000, 0,
+                                     timer_test_callback, &test_data);
+        ASSERT_NE(timers[i], nullptr);
+        pd_timer_start(timers[i]);
+    }
+
+    /* Destroy them in interleaved order to force fd reuse among live
+     * watchers. */
+    for (int i = 0; i < N; i += 2) {
+        pd_timer_destroy(timers[i]);
+    }
+    for (int i = 1; i < N; i += 2) {
+        pd_timer_destroy(timers[i]);
+    }
+
+    pd_loop_destroy(loop);
+}
+
+/* Test: Create a long-lived watcher, then many short-lived timers.
+ * Forces the kernel to recycle the closed timerfd slot to the long-lived
+ * watcher's fd, so the bad epoll_ctl(EPOLL_CTL_DEL) after close can
+ * silently remove the long-lived watcher's epoll registration. The
+ * test is a regression guard — it passes both before and after the fix,
+ * but the fix removes the stale EPOLL_CTL_DEL syscalls (visible under
+ * strace). */
+TEST(TimerTest, RecycleFdWithLiveWatcher) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    /* Long-lived raw watcher on a pipe fd — must survive many timer
+     * create/destroy cycles so its fd is a candidate for reuse. */
+    int pipefds[2];
+    ASSERT_EQ(pipe(pipefds), 0);
+    pd_watcher_t *long_lived = pd_watcher_create(loop, pipefds[0],
+                                                  PD_EVENT_READ,
+                                                  timer_test_callback,
+                                                  nullptr);
+    ASSERT_NE(long_lived, nullptr);
+
+    /* Create and destroy many timers. After ~1000 timerfds, kernel fd
+     * numbers wrap and the close in epoll_timer_destroy will return a
+     * slot that the long-lived watcher may or may not occupy. The bug
+     * shows up as EBADF on a stale fd in strace regardless. */
+    for (int i = 0; i < 1000; i++) {
+        pd_timer_t *timer = pd_timer_create(loop, 1000, 0,
+                                             timer_test_callback, nullptr);
+        ASSERT_NE(timer, nullptr);
+        pd_timer_destroy(timer);
+    }
+
+    /* The long-lived watcher should still be functional after the
+     * destroy storm — its fd must not have been removed from epoll
+     * by a stale EPOLL_CTL_DEL on a recycled fd. */
+    pd_watcher_destroy(long_lived);
+    close(pipefds[0]);
+    close(pipefds[1]);
+    pd_loop_destroy(loop);
+}

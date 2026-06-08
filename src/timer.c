@@ -106,19 +106,20 @@ pd_error_t pd_timer_destroy(pd_timer_t *timer) {
         pd_timer_stop(timer);
     }
 
-    /* Call platform-specific timer destroy */
-    if (timer->loop && timer->loop->ops && timer->loop->ops->timer_destroy) {
-        timer->loop->ops->timer_destroy(timer);
-    }
-
-    /* Destroy internal watcher if it exists and we own it.
-     * On epoll, the watcher was created via pd_watcher_create and should
-     * be destroyed via pd_watcher_destroy. On kqueue/IOCP, the watcher
-     * was manually allocated and already freed by the platform's
-     * timer_destroy function. */
+    /* Destroy the internal watcher BEFORE the platform timer_destroy
+     * closes the underlying fd. On epoll, pd_watcher_destroy calls
+     * epoll_ctl(EPOLL_CTL_DEL) on the watcher's fd, which must still be
+     * open. If the platform close()s the fd first, the DEL runs on a
+     * closed (and possibly recycled) fd — corrupting kernel epoll state
+     * for whichever watcher now owns that fd. */
     if (timer->watcher && timer->owns_watcher) {
         pd_watcher_destroy(timer->watcher);
         timer->watcher = NULL;
+    }
+
+    /* Call platform-specific timer destroy */
+    if (timer->loop && timer->loop->ops && timer->loop->ops->timer_destroy) {
+        timer->loop->ops->timer_destroy(timer);
     }
 
     free(timer);
