@@ -30,6 +30,7 @@ typedef struct pd_platform_ops {
 
     /* Watcher operations */
     int (*watcher_register)(struct pd_loop *loop, struct pd_watcher *watcher);
+    int (*watcher_register_handle)(struct pd_loop *loop, struct pd_watcher *watcher);
     int (*watcher_update)(struct pd_watcher *watcher, pd_event_t events);
     int (*watcher_unregister)(struct pd_watcher *watcher);
 

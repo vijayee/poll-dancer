@@ -62,6 +62,7 @@ static void iocp_loop_destroy(pd_loop_t *loop);
 static int iocp_loop_run(pd_loop_t *loop, int timeout_ms);
 static int iocp_loop_stop(pd_loop_t *loop);
 static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher);
+static int iocp_watcher_register_handle(pd_loop_t *loop, pd_watcher_t *watcher);
 static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events);
 static int iocp_watcher_unregister(pd_watcher_t *watcher);
 static int iocp_async_send(pd_loop_t *loop, void *data);
@@ -77,6 +78,7 @@ const pd_platform_ops_t pd_platform_iocp = {
     .loop_run = iocp_loop_run,
     .loop_stop = iocp_loop_stop,
     .watcher_register = iocp_watcher_register,
+    .watcher_register_handle = iocp_watcher_register_handle,
     .watcher_update = iocp_watcher_update,
     .watcher_unregister = iocp_watcher_unregister,
     .async_send = iocp_async_send,
@@ -198,6 +200,22 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
         pd_watcher_t *watcher = (pd_watcher_t *)entry->lpCompletionKey;
 
         if (!watcher || !watcher->callback) {
+            continue;
+        }
+
+        /* Check whether the I/O was cancelled (CancelIoEx, pipe close,
+         * etc.) before reaching the user. Without this, a cancelled
+         * read or write would invoke the callback with a HANGUP/ERROR
+         * event that's really just our own teardown surfacing. */
+        DWORD io_error = (DWORD)(ULONG_PTR)entry->lpOverlapped->Internal;
+        if (entry->lpOverlapped->Internal == STATUS_CANCELLED ||
+            io_error == ERROR_OPERATION_ABORTED) {
+            /* Reset the pending-operation state for this watcher so a
+             * subsequent watcher_update can re-issue. */
+            pd_iocp_watcher_data_t *wd = (pd_iocp_watcher_data_t *)watcher->platform_data;
+            if (wd) {
+                wd->pending_operation = 0;
+            }
             continue;
         }
 
@@ -368,13 +386,109 @@ static int iocp_watcher_unregister(pd_watcher_t *watcher) {
         return PD_ERR_INVALID_ARG;
     }
 
-    /* Cancel any pending I/O operations */
-    CancelIo(fd_to_handle(watcher->fd));
+    /* Cancel any pending I/O operations. Use CancelIoEx when we have a
+     * real HANDLE (handle-watchers and any future fd-watchers that have
+     * resolved to one); fall back to CancelIo for the legacy socket path
+     * which still passes a CRT fd. */
+    HANDLE handle = NULL;
+#ifdef PD_PLATFORM_WINDOWS
+    if (watcher->is_handle && watcher->handle) {
+        handle = (HANDLE)watcher->handle;
+        if (handle != INVALID_HANDLE_VALUE) {
+            CancelIoEx(handle, &watcher_data->overlapped);
+        }
+    } else if (watcher->fd >= 0) {
+        HANDLE fd_handle = fd_to_handle(watcher->fd);
+        if (fd_handle && fd_handle != INVALID_HANDLE_VALUE) {
+            CancelIo(fd_handle);
+        }
+    }
+#else
+    (void)handle;
+#endif
 
     /* Free watcher platform data */
     free(watcher->platform_data);
     watcher->platform_data = NULL;
 
+    return PD_OK;
+}
+
+static int iocp_watcher_register_handle(pd_loop_t *loop, pd_watcher_t *watcher) {
+    if (!loop || !watcher || !watcher->handle) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    pd_iocp_data_t *data = (pd_iocp_data_t *)loop->platform_data;
+    if (!data) {
+        return PD_ERR_LOOP_CLOSED;
+    }
+
+    HANDLE handle = (HANDLE)watcher->handle;
+    if (handle == INVALID_HANDLE_VALUE) {
+        return PD_ERR_INVALID_ARG;
+    }
+
+    /* Allocate watcher platform data. We reuse the same struct as the
+     * socket path so dispatch in iocp_loop_run doesn't need a separate
+     * branch. The buffer is a fixed 4 KiB read buffer; callers that need
+     * more control over the buffer can use the existing wsa_buffer
+     * field, but for named pipes 4 KiB matches typical request sizes. */
+    pd_iocp_watcher_data_t *watcher_data = calloc(1, sizeof(pd_iocp_watcher_data_t));
+    if (!watcher_data) {
+        pd_set_system_error(loop, GetLastError());
+        return PD_ERR_NO_MEMORY;
+    }
+
+    watcher_data->events = watcher->events;
+    watcher_data->wsa_buffer.buf = watcher_data->buffer;
+    watcher_data->wsa_buffer.len = sizeof(watcher_data->buffer);
+
+    /* Associate the HANDLE with the IOCP. The completion key is the
+     * watcher pointer so the completion dispatch can recover it
+     * without a separate lookup table. */
+    HANDLE result = CreateIoCompletionPort(
+        handle,
+        data->iocp_handle,
+        (ULONG_PTR)watcher,
+        0
+    );
+
+    if (result == NULL) {
+        DWORD err = GetLastError();
+        pd_set_system_error(loop, err);
+        free(watcher_data);
+        return PD_ERR_SYSTEM;
+    }
+
+    /* For READ monitoring, issue an async read. ReadFile on an
+     * overlapped handle returns FALSE with ERROR_IO_PENDING on success
+     * (the "I/O is pending" return is the normal async path). */
+    if (watcher->events & PD_EVENT_READ) {
+        DWORD bytes_read = 0;
+        memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
+
+        BOOL ok = ReadFile(
+            handle,
+            watcher_data->buffer,
+            sizeof(watcher_data->buffer),
+            &bytes_read,
+            &watcher_data->overlapped
+        );
+
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING && err != ERROR_MORE_DATA) {
+                pd_set_system_error(loop, err);
+                free(watcher_data);
+                return PD_ERR_SYSTEM;
+            }
+        }
+
+        watcher_data->pending_operation = 1;  /* Read pending */
+    }
+
+    watcher->platform_data = watcher_data;
     return PD_OK;
 }
 
@@ -611,6 +725,7 @@ const pd_platform_ops_t pd_platform_iocp = {
     .loop_run = NULL,
     .loop_stop = NULL,
     .watcher_register = NULL,
+    .watcher_register_handle = NULL,
     .watcher_update = NULL,
     .watcher_unregister = NULL,
     .async_send = NULL,

@@ -115,6 +115,30 @@ pd_watcher_t *pd_watcher_create(pd_loop_t *loop,
                                  void *user_data);
 
 /**
+ * Create a new watcher for a native Windows HANDLE.
+ *
+ * Use this when the resource to monitor is a Windows HANDLE (e.g. a named
+ * pipe) rather than a CRT file descriptor. On POSIX builds this is not
+ * meaningful and returns NULL.
+ *
+ * The handle must remain valid for the lifetime of the watcher. The
+ * watcher does not take ownership of the handle; the caller is responsible
+ * for closing it after destroying the watcher.
+ *
+ * @param loop The loop to attach the watcher to
+ * @param handle The native handle to monitor (e.g. a Windows HANDLE)
+ * @param events The events to monitor (combination of pd_event_t values)
+ * @param callback The callback to invoke when events occur
+ * @param user_data User data to pass to the callback
+ * @return A new watcher handle, or NULL on error
+ */
+pd_watcher_t *pd_watcher_create_for_handle(pd_loop_t *loop,
+                                            void *handle,
+                                            pd_event_t events,
+                                            pd_callback_t callback,
+                                            void *user_data);
+
+/**
  * Update the events monitored by a watcher.
  *
  * @param watcher The watcher to update

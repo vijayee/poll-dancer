@@ -37,6 +37,63 @@ pd_watcher_t *pd_watcher_create(pd_loop_t *loop,
     return watcher;
 }
 
+pd_watcher_t *pd_watcher_create_for_handle(pd_loop_t *loop,
+                                            void *handle,
+                                            pd_event_t events,
+                                            pd_callback_t callback,
+                                            void *user_data) {
+    if (!loop) {
+        return NULL;
+    }
+
+    /* Allocate watcher structure */
+    pd_watcher_t *watcher = calloc(1, sizeof(pd_watcher_t));
+    if (!watcher) {
+        return NULL;
+    }
+
+    /* The fd slot is left at 0; the discriminator is_handle tells the
+     * platform backend to use `handle` directly. This avoids the
+     * _get_osfhandle round-trip (which is a CRT table lookup, not a
+     * bit-cast, and is unsafe for handles that were never CRT fds). */
+    watcher->fd = -1;
+    watcher->handle = handle;
+    watcher->is_handle = 1;
+    watcher->events = events;
+    watcher->callback = callback;
+    watcher->user_data = user_data;
+    watcher->loop = loop;
+    watcher->active = 1;
+    watcher->ref_count = 1;
+
+    /* Register with the handle-aware platform backend, if any. POSIX
+     * backends don't implement this slot; the watcher is only meaningful
+     * on Windows. */
+    if (loop->ops && loop->ops->watcher_register_handle) {
+        int result = loop->ops->watcher_register_handle(loop, watcher);
+        if (result != 0) {
+            free(watcher);
+            return NULL;
+        }
+    } else {
+        /* No handle-aware backend: the platform doesn't support it. */
+        free(watcher);
+        return NULL;
+    }
+
+    /* Add to the loop's watcher list. */
+    int result = pd_loop_add_watcher(loop, watcher);
+    if (result != 0) {
+        if (loop->ops && loop->ops->watcher_unregister) {
+            loop->ops->watcher_unregister(watcher);
+        }
+        free(watcher);
+        return NULL;
+    }
+
+    return watcher;
+}
+
 int pd_watcher_init(pd_watcher_t *watcher,
                     pd_loop_t *loop,
                     int fd,

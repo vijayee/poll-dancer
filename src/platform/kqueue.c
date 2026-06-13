@@ -52,6 +52,7 @@ static void kqueue_loop_destroy(pd_loop_t *loop);
 static int kqueue_loop_run(pd_loop_t *loop, int timeout_ms);
 static int kqueue_loop_stop(pd_loop_t *loop);
 static int kqueue_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher);
+static int kqueue_watcher_register_handle_unused(pd_loop_t *loop, pd_watcher_t *watcher);
 static int kqueue_watcher_update(pd_watcher_t *watcher, pd_event_t events);
 static int kqueue_watcher_unregister(pd_watcher_t *watcher);
 static int kqueue_async_send(pd_loop_t *loop, void *data);
@@ -60,6 +61,17 @@ static int kqueue_timer_start(pd_timer_t *timer);
 static int kqueue_timer_stop(pd_timer_t *timer);
 static void kqueue_timer_destroy(pd_timer_t *timer);
 
+/**
+ * HANDLE-based watcher registration is a Windows-only feature. On POSIX
+ * builds this slot is a stub that returns PD_ERR_NOT_IMPLEMENTED so the
+ * vtable is fully populated.
+ */
+static int kqueue_watcher_register_handle_unused(pd_loop_t *loop, pd_watcher_t *watcher) {
+    (void)loop;
+    (void)watcher;
+    return PD_ERR_NOT_IMPLEMENTED;
+}
+
 /* Platform operations */
 const pd_platform_ops_t pd_platform_kqueue = {
     .loop_create = kqueue_loop_create,
@@ -67,6 +79,7 @@ const pd_platform_ops_t pd_platform_kqueue = {
     .loop_run = kqueue_loop_run,
     .loop_stop = kqueue_loop_stop,
     .watcher_register = kqueue_watcher_register,
+    .watcher_register_handle = kqueue_watcher_register_handle_unused,
     .watcher_update = kqueue_watcher_update,
     .watcher_unregister = kqueue_watcher_unregister,
     .async_send = kqueue_async_send,
