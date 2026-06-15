@@ -82,6 +82,7 @@ const pd_platform_ops_t pd_platform_kqueue = {
     .watcher_register_handle = kqueue_watcher_register_handle_unused,
     .watcher_update = kqueue_watcher_update,
     .watcher_unregister = kqueue_watcher_unregister,
+    .watcher_drain_read = NULL, /* kqueue: caller does its own recv() */
     .async_send = kqueue_async_send,
     .timer_create = kqueue_timer_create,
     .timer_start = kqueue_timer_start,

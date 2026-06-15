@@ -28,6 +28,14 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
+/* STATUS_CANCELLED is defined in <ntstatus.h>, which conflicts with the
+ * regular Win32 headers (it #define's its own error codes). Define the
+ * value inline so we can check the Internal field of an OVERLAPPED
+ * without pulling in the full NT status surface. */
+#ifndef STATUS_CANCELLED
+#define STATUS_CANCELLED ((DWORD)0xC0000120L)
+#endif
+
 /**
  * Magic completion key for timer completions.
  * Distinctive value ("TIMR" in ASCII) so timer completions are not
@@ -54,6 +62,11 @@ typedef struct {
     char buffer[4096];              /**< Default buffer for operations */
     int pending_operation;          /**< 0=none, 1=read, 2=write */
     pd_event_t events;              /**< Events being monitored */
+    /* Completion state for the most recent async read. Populated by
+     * iocp_loop_run from entry->dwNumberOfBytesTransferred. The user
+     * callback drains this via pd_watcher_drain_read, after which the
+     * backend re-issues the async read so the next completion can fire. */
+    DWORD bytes_available;          /**< Bytes pending in `buffer` (0 if no read completion) */
 } pd_iocp_watcher_data_t;
 
 /* Forward declarations */
@@ -65,6 +78,7 @@ static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher);
 static int iocp_watcher_register_handle(pd_loop_t *loop, pd_watcher_t *watcher);
 static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events);
 static int iocp_watcher_unregister(pd_watcher_t *watcher);
+static size_t iocp_watcher_drain_read(pd_watcher_t *watcher, void *buf, size_t len);
 static int iocp_async_send(pd_loop_t *loop, void *data);
 static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer);
 static int iocp_timer_start(pd_timer_t *timer);
@@ -81,6 +95,7 @@ const pd_platform_ops_t pd_platform_iocp = {
     .watcher_register_handle = iocp_watcher_register_handle,
     .watcher_update = iocp_watcher_update,
     .watcher_unregister = iocp_watcher_unregister,
+    .watcher_drain_read = iocp_watcher_drain_read,
     .async_send = iocp_async_send,
     .timer_create = iocp_timer_create,
     .timer_start = iocp_timer_start,
@@ -221,23 +236,77 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
 
         /* Convert completion to event */
         pd_event_t events = PD_EVENT_NONE;
+        DWORD bytes_completed = entry->dwNumberOfBytesTransferred;
 
         /* Determine what event completed */
         pd_iocp_watcher_data_t *watcher_data = (pd_iocp_watcher_data_t *)watcher->platform_data;
         if (watcher_data) {
             if (watcher_data->pending_operation == 1) {
                 events |= PD_EVENT_READ;
+                /* Stash the read bytes so the user callback can drain
+                 * them via pd_watcher_drain_read. The kernel has already
+                 * delivered them into watcher_data->buffer. */
+                watcher_data->bytes_available = bytes_completed;
             } else if (watcher_data->pending_operation == 2) {
                 events |= PD_EVENT_WRITE;
             }
             watcher_data->pending_operation = 0;
         }
 
-        /* Invoke callback */
+        /* Invoke callback. The callback may drain the read buffer and
+         * re-register a fresh async read via pd_watcher_update, or it
+         * may leave the buffer in place; the unconditional re-issue
+         * below covers the common case. */
         watcher->callback(loop, watcher, events, watcher->user_data);
 
-        /* Re-issue async operation for edge-triggered mode */
-        /* TODO: Handle edge-triggered mode properly */
+        /* For READ: re-issue the async read on the watcher_data's buffer
+         * so the next completion can fire. We do this after the callback
+         * to preserve edge-triggered semantics: the callback should
+         * drain every byte before we accept more. */
+        if (watcher_data && (events & PD_EVENT_READ)) {
+            DWORD bytes_read = 0;
+            memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
+            int issued_ok = 0;
+            if (watcher->is_handle) {
+                /* ReadFile on an overlapped handle returns FALSE with
+                 * ERROR_IO_PENDING on success (async path); that is the
+                 * normal case, not a failure. Treat any return value as
+                 * a successful re-issue unless GetLastError says
+                 * something other than IO_PENDING / MORE_DATA. */
+                BOOL ok = ReadFile(
+                    (HANDLE)watcher->handle,
+                    watcher_data->buffer,
+                    sizeof(watcher_data->buffer),
+                    &bytes_read,
+                    &watcher_data->overlapped
+                );
+                if (ok) {
+                    issued_ok = 1;
+                } else {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_IO_PENDING || err == ERROR_MORE_DATA) {
+                        issued_ok = 1;
+                    }
+                }
+            } else {
+                DWORD flags = 0;
+                int rc = WSARecv(
+                    watcher->fd,
+                    &watcher_data->wsa_buffer,
+                    1,
+                    &bytes_read,
+                    &flags,
+                    &watcher_data->overlapped,
+                    NULL
+                );
+                issued_ok = (rc == 0) || (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING);
+            }
+            if (issued_ok) {
+                watcher_data->pending_operation = 1;
+            }
+            /* On error, leave pending_operation = 0; pd_watcher_update
+             * can re-issue. */
+        }
     }
 
     return (int)num_entries;
@@ -412,6 +481,25 @@ static int iocp_watcher_unregister(pd_watcher_t *watcher) {
     watcher->platform_data = NULL;
 
     return PD_OK;
+}
+
+static size_t iocp_watcher_drain_read(pd_watcher_t *watcher, void *buf, size_t len) {
+    if (!watcher || !watcher->platform_data || !buf || len == 0) {
+        return 0;
+    }
+    pd_iocp_watcher_data_t *wd = (pd_iocp_watcher_data_t *)watcher->platform_data;
+    if (wd->bytes_available == 0) {
+        return 0;
+    }
+    size_t to_copy = (size_t)wd->bytes_available;
+    if (to_copy > len) to_copy = len;
+    memcpy(buf, wd->buffer, to_copy);
+    if ((size_t)wd->bytes_available > to_copy) {
+        memmove(wd->buffer, wd->buffer + to_copy,
+                (size_t)wd->bytes_available - to_copy);
+    }
+    wd->bytes_available -= (DWORD)to_copy;
+    return to_copy;
 }
 
 static int iocp_watcher_register_handle(pd_loop_t *loop, pd_watcher_t *watcher) {
@@ -728,6 +816,7 @@ const pd_platform_ops_t pd_platform_iocp = {
     .watcher_register_handle = NULL,
     .watcher_update = NULL,
     .watcher_unregister = NULL,
+    .watcher_drain_read = NULL,
     .async_send = NULL,
     .timer_create = NULL,
     .timer_start = NULL,

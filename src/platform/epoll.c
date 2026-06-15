@@ -73,6 +73,7 @@ const pd_platform_ops_t pd_platform_epoll = {
     .watcher_register_handle = epoll_watcher_register_handle_unused,
     .watcher_update = epoll_watcher_update,
     .watcher_unregister = epoll_watcher_unregister,
+    .watcher_drain_read = NULL, /* epoll: caller does its own recv() */
     .async_send = epoll_async_send,
     .timer_create = epoll_timer_create,
     .timer_start = epoll_timer_start,

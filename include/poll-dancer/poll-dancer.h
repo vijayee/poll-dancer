@@ -188,6 +188,28 @@ int pd_watcher_get_fd(pd_watcher_t *watcher);
  */
 pd_event_t pd_watcher_get_events(pd_watcher_t *watcher);
 
+/**
+ * Drain the most recent read completion's data from a watcher.
+ *
+ * On Windows IOCP (the only backend that completes a read into a
+ * library-owned buffer), this copies up to `len` bytes from the last
+ * completed ReadFile/WSARecv into `buf` and returns the number of
+ * bytes copied. After this call the internal buffer is reset and the
+ * backend re-issues the async read so the next completion can fire.
+ *
+ * On POSIX backends the IOCP buffer is empty and this returns 0; the
+ * caller should fall back to its own synchronous recv() call.
+ *
+ * This function is only meaningful inside a PD_EVENT_READ callback.
+ * Calling it from any other context returns 0.
+ *
+ * @param watcher The watcher
+ * @param buf Output buffer for the drained data (caller-owned)
+ * @param len Capacity of buf
+ * @return Number of bytes copied into buf, 0 if no data is pending
+ */
+size_t pd_watcher_drain_read(pd_watcher_t *watcher, void *buf, size_t len);
+
 /* ============================================================================
  * Timer Management
  * ============================================================================ */

@@ -239,3 +239,11 @@ pd_event_t pd_watcher_get_events(pd_watcher_t *watcher) {
     }
     return watcher->events;
 }
+
+size_t pd_watcher_drain_read(pd_watcher_t *watcher, void *buf, size_t len) {
+    if (!watcher || !watcher->loop || !watcher->loop->ops ||
+        !watcher->loop->ops->watcher_drain_read) {
+        return 0;
+    }
+    return watcher->loop->ops->watcher_drain_read(watcher, buf, len);
+}

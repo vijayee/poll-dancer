@@ -33,6 +33,10 @@ typedef struct pd_platform_ops {
     int (*watcher_register_handle)(struct pd_loop *loop, struct pd_watcher *watcher);
     int (*watcher_update)(struct pd_watcher *watcher, pd_event_t events);
     int (*watcher_unregister)(struct pd_watcher *watcher);
+    /* Drain bytes from the watcher's last completed read into `buf`.
+     * Only the IOCP backend implements this; POSIX backends return 0
+     * and the caller falls back to its own synchronous recv(). */
+    size_t (*watcher_drain_read)(struct pd_watcher *watcher, void *buf, size_t len);
 
     /* Async operations */
     int (*async_send)(struct pd_loop *loop, void *data);
