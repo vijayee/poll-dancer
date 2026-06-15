@@ -412,34 +412,93 @@ static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events) {
         return PD_ERR_INVALID_ARG;
     }
 
-    /* Cancel any pending operations */
-    /* TODO: Implement proper cancellation */
+    /* Cancel any in-flight read whose new event mask no longer requests
+     * PD_EVENT_READ. CancelIoEx posts a completion with
+     * ERROR_OPERATION_ABORTED, which iocp_loop_run already filters out
+     * (and resets pending_operation to 0). For the socket path, the
+     * legacy CancelIo behaves the same way. We don't synchronously
+     * wait for the cancellation to land; the next read re-issue will
+     * observe pending_operation == 0 (or the cancelled completion will
+     * have cleared it by then). */
+    if (watcher_data->pending_operation == 1 && !(events & PD_EVENT_READ)) {
+        HANDLE cancel_handle = NULL;
+        if (watcher->is_handle && watcher->handle &&
+                watcher->handle != INVALID_HANDLE_VALUE) {
+            cancel_handle = (HANDLE)watcher->handle;
+        } else if (watcher->fd >= 0) {
+            cancel_handle = fd_to_handle(watcher->fd);
+        }
+        if (cancel_handle && cancel_handle != INVALID_HANDLE_VALUE) {
+            if (watcher->is_handle) {
+                CancelIoEx(cancel_handle, &watcher_data->overlapped);
+            } else {
+                CancelIo(cancel_handle);
+            }
+        }
+        /* Don't clear pending_operation here: iocp_loop_run clears it
+         * when the cancelled completion is dequeued. Until then, the
+         * re-issue branch below treats pending_operation as authoritative. */
+    }
 
     watcher_data->events = events;
     watcher->events = events;
 
-    /* Re-issue operations for new event mask */
+    /* Re-issue operations for the new event mask. IOCP only drives READ
+     * through the overlapped machinery; the user does synchronous writes
+     * from the callback. So WRITE is a no-op here on both the socket and
+     * the HANDLE path. The re-issue uses ReadFile for HANDLE watchers
+     * and WSARecv for socket watchers; calling WSARecv on a HANDLE
+     * watcher would pass fd=-1, which is a hard error. */
     if (events & PD_EVENT_READ && watcher_data->pending_operation == 0) {
         DWORD bytes_received = 0;
-        DWORD flags = 0;
         memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
 
-        int rc = WSARecv(
-            watcher->fd,
-            &watcher_data->wsa_buffer,
-            1,
-            &bytes_received,
-            &flags,
-            &watcher_data->overlapped,
-            NULL
-        );
-
-        if (rc == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-            pd_set_system_error(watcher->loop, WSAGetLastError());
-            return PD_ERR_SYSTEM;
+        int issued_ok = 0;
+        if (watcher->is_handle && watcher->handle &&
+                watcher->handle != INVALID_HANDLE_VALUE) {
+            HANDLE handle = (HANDLE)watcher->handle;
+            BOOL ok = ReadFile(
+                handle,
+                watcher_data->buffer,
+                sizeof(watcher_data->buffer),
+                &bytes_received,
+                &watcher_data->overlapped
+            );
+            if (ok) {
+                issued_ok = 1;
+            } else {
+                DWORD err = GetLastError();
+                if (err == ERROR_IO_PENDING || err == ERROR_MORE_DATA) {
+                    issued_ok = 1;
+                } else {
+                    pd_set_system_error(watcher->loop, err);
+                    return PD_ERR_SYSTEM;
+                }
+            }
+        } else {
+            DWORD flags = 0;
+            int rc = WSARecv(
+                watcher->fd,
+                &watcher_data->wsa_buffer,
+                1,
+                &bytes_received,
+                &flags,
+                &watcher_data->overlapped,
+                NULL
+            );
+            if (rc == 0) {
+                issued_ok = 1;
+            } else if (WSAGetLastError() == WSA_IO_PENDING) {
+                issued_ok = 1;
+            } else {
+                pd_set_system_error(watcher->loop, WSAGetLastError());
+                return PD_ERR_SYSTEM;
+            }
         }
 
-        watcher_data->pending_operation = 1;
+        if (issued_ok) {
+            watcher_data->pending_operation = 1;
+        }
     }
 
     return PD_OK;
