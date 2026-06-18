@@ -45,6 +45,19 @@
 #define PD_IOCP_TIMER_KEY ((ULONG_PTR)0x54494D52)
 
 /**
+ * Magic completion key for drain-sync completions. The dispatch path posts
+ * one of these after it has finished mutating watcher state (e.g. just
+ * destroyed a timer) and waits for the loop thread to process it. The wait
+ * guarantees that the loop has already consumed any in-flight completion
+ * packets the dispatcher cares about (e.g. a timer's final completion,
+ * whose lpOverlapped is the now-freed pd_timer_t*).
+ *
+ * lpOverlapped carries a pd_iocp_sync_t* describing what the loop thread
+ * should do (typically: signal an event the dispatcher is waiting on).
+ */
+#define PD_IOCP_SYNC_KEY ((ULONG_PTR)0x53594E43)
+
+/**
  * Platform-specific data for IOCP.
  */
 typedef struct {
@@ -52,6 +65,37 @@ typedef struct {
     OVERLAPPED_ENTRY *events;        /**< Event array for GetQueuedCompletionStatusEx */
     int max_events;                  /**< Maximum events per wait */
 } pd_iocp_data_t;
+
+/**
+ * Payload for a drain-sync completion. The dispatcher fills in `event`,
+ * posts the completion, and blocks on the event. The loop thread, when it
+ * processes the completion, sets the event and returns. The blocking
+ * dispatcher then knows the loop has caught up.
+ */
+typedef struct {
+    HANDLE event;                    /**< Signaled by loop thread after processing */
+} pd_iocp_sync_t;
+
+/**
+ * Platform-specific timer data for IOCP timers. Defined here (rather than
+ * near the iocp_timer_* implementations) so iocp_loop_run can reference
+ * the `destroyed` flag while processing completion packets — see the
+ * PD_IOCP_TIMER_KEY branch in iocp_loop_run.
+ */
+typedef struct {
+    HANDLE queue_timer;    /**< Windows timer queue timer handle */
+    HANDLE iocp_handle;    /**< IOCP handle for posting completions */
+    HANDLE stop_event;     /**< Event for safe timer stop/destroy synchronization */
+    int started;           /**< Non-zero if timer has been started */
+    /* Set non-zero by iocp_timer_destroy under the timer_actor's loop_lock
+     * once destroy begins. The Windows thread-pool callback and the loop's
+     * completion handler both check this flag and skip processing if set,
+     * providing a second line of defense against use-after-free in the
+     * brief window where the iocp_drain_sync has not yet caught the
+     * completion. The destroy path then waits for the loop to drain via
+     * iocp_drain_sync before freeing anything. */
+    volatile int destroyed;
+} pd_iocp_timer_data_t;
 
 /**
  * Platform-specific watcher data for IOCP.
@@ -197,11 +241,35 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
     for (ULONG i = 0; i < num_entries; i++) {
         OVERLAPPED_ENTRY *entry = &data->events[i];
 
+        /* Drain-sync completion: signal the event the dispatcher is
+         * blocked on. By FIFO ordering on the IOCP, every earlier
+         * completion packet the dispatcher cared about has already been
+         * handled by the time we get here, so the dispatcher can now
+         * safely free any resources those packets referenced. */
+        if (entry->lpCompletionKey == PD_IOCP_SYNC_KEY) {
+            pd_iocp_sync_t *sync = (pd_iocp_sync_t *)entry->lpOverlapped;
+            if (sync != NULL && sync->event != NULL) {
+                SetEvent(sync->event);
+            }
+            continue;
+        }
+
         /* Check if this is a timer completion (identified by magic key) */
         if (entry->lpCompletionKey == PD_IOCP_TIMER_KEY) {
             /* Timer pointer was passed via lpOverlapped */
             pd_timer_t *timer = (pd_timer_t *)entry->lpOverlapped;
             if (timer && timer->callback) {
+                /* The timer's destroy path sets timer->platform_data->destroyed
+                 * before calling iocp_drain_sync. If we observe the flag set,
+                 * skip invoking the user callback — the timer is on its way out
+                 * and may already be partially torn down. This pairs with the
+                 * check in iocp_timer_callback and the iocp_drain_sync barrier
+                 * to keep the user callback from running on a freed timer. */
+                pd_iocp_timer_data_t *td =
+                    (pd_iocp_timer_data_t *)timer->platform_data;
+                if (td == NULL || td->destroyed) {
+                    continue;
+                }
                 timer->callback(loop, timer->watcher, PD_EVENT_READ, timer->user_data);
             }
             continue;
@@ -334,6 +402,44 @@ static int iocp_loop_stop(pd_loop_t *loop) {
     }
 
     return PD_OK;
+}
+
+/**
+ * Block until the loop thread has processed all completion packets that
+ * were already in flight at the time of the call. Used by the timer
+ * destroy path to ensure any pending timer completion (whose lpOverlapped
+ * is the soon-to-be-freed pd_timer_t*) has been consumed by the loop
+ * before the timer is freed.
+ *
+ * The mechanism: allocate a wait event, post a sync completion carrying
+ * a pointer to the event as lpOverlapped, then WaitForSingleObject on
+ * it. The loop, on consuming the sync completion, sets the event. Since
+ * the IOCP preserves FIFO ordering for PostQueuedCompletionStatus packets
+ * posted to the same handle, every completion the dispatcher cared about
+ * has been processed by the time the event fires.
+ */
+static void iocp_drain_sync(pd_loop_t *loop) {
+    if (!loop || !loop->platform_data) {
+        return;
+    }
+    pd_iocp_data_t *data = (pd_iocp_data_t *)loop->platform_data;
+    pd_iocp_sync_t sync = {0};
+    sync.event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (sync.event == NULL) {
+        return;
+    }
+    /* Post AFTER any earlier completion packets the loop might still be
+     * holding in its `events` buffer or processing. FIFO ordering
+     * guarantees the loop won't see this sync packet until those earlier
+     * ones are handled. */
+    PostQueuedCompletionStatus(
+        data->iocp_handle,
+        0,
+        PD_IOCP_SYNC_KEY,
+        (OVERLAPPED *)&sync
+    );
+    WaitForSingleObject(sync.event, 5000);
+    CloseHandle(sync.event);
 }
 
 static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
@@ -649,16 +755,6 @@ static int iocp_async_send(pd_loop_t *loop, void *data) {
  * ============================================================================ */
 
 /**
- * Platform-specific timer data for IOCP timers.
- */
-typedef struct {
-    HANDLE queue_timer;    /**< Windows timer queue timer handle */
-    HANDLE iocp_handle;    /**< IOCP handle for posting completions */
-    HANDLE stop_event;     /**< Event for safe timer stop/destroy synchronization */
-    int started;           /**< Non-zero if timer has been started */
-} pd_iocp_timer_data_t;
-
-/**
  * Windows timer callback. Runs on a thread pool thread.
  * Posts a completion to IOCP so the user callback runs on the loop thread.
  */
@@ -670,6 +766,13 @@ static VOID CALLBACK iocp_timer_callback(PVOID lpParam, BOOLEAN timer_or_wait_fi
     }
 
     pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
+
+    /* Refuse to post a completion for a timer whose destroy has begun.
+     * Even with the iocp_drain_sync barrier, a completion posted here
+     * after the destroy read the destroyed flag would race the free. */
+    if (timer_data->destroyed) {
+        return;
+    }
 
     /* Post a completion packet to IOCP so the user callback runs on the loop thread.
      * Use PD_IOCP_TIMER_KEY as the completion key to identify this as a timer
@@ -837,6 +940,10 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
      * prevents use-after-free on timer->platform_data. */
     if (timer->platform_data) {
         pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
+        /* Mark the timer as destroyed BEFORE DeleteTimerQueueTimer so that
+         * any in-flight iocp_timer_callback observes the flag and refuses
+         * to post a completion that would later race the free. */
+        timer_data->destroyed = 1;
         if (timer_data->started && timer_data->queue_timer) {
             DeleteTimerQueueTimer(NULL, timer_data->queue_timer, INVALID_HANDLE_VALUE);
             timer_data->queue_timer = NULL;
@@ -849,6 +956,17 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
         }
         free(timer_data);
         timer->platform_data = NULL;
+    }
+
+    /* Drain any in-flight completion packets BEFORE freeing the
+     * placeholder watcher. After DeleteTimerQueueTimer(INVALID_HANDLE_VALUE)
+     * returns, no new completions will be posted for this timer, but
+     * completions already in the IOCP queue still reference this timer
+     * via lpOverlapped. Wait for the loop to consume them; otherwise the
+     * loop thread would dereference a freed pointer when it next runs
+     * pd_loop_run_once. */
+    if (timer->loop && timer->watcher) {
+        iocp_drain_sync(timer->loop);
     }
 
     /* Remove the placeholder watcher from the loop's watcher list and free it.
