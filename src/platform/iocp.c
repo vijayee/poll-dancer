@@ -151,9 +151,17 @@ const pd_platform_ops_t pd_platform_iocp = {
 
 /**
  * Convert file descriptor to Windows handle.
+ *
+ * poll-dancer callers pass a Winsock SOCKET (a raw kernel handle, NOT a CRT
+ * file descriptor) in watcher->fd. _get_osfhandle() expects a CRT fd from
+ * _open/open; calling it on a SOCKET value triggers a debug heap check that
+ * aborts the process with STATUS_STACK_BUFFER_OVERRUN (0xC0000409). A SOCKET
+ * is already usable as a HANDLE for CreateIoCompletionPort/ReadFile/CancelIoEx
+ * (Winsock sockets and file handles share the same HANDLE namespace), and
+ * SOCKET values fit in 32 bits in practice, so cast directly.
  */
 static HANDLE fd_to_handle(int fd) {
-    return (HANDLE)_get_osfhandle(fd);
+    return (HANDLE)(SOCKET)(uintptr_t)(unsigned int)fd;
 }
 
 static int iocp_loop_create(pd_loop_t *loop, const pd_loop_config_t *config) {
@@ -330,8 +338,19 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
         /* For READ: re-issue the async read on the watcher_data's buffer
          * so the next completion can fire. We do this after the callback
          * to preserve edge-triggered semantics: the callback should
-         * drain every byte before we accept more. */
-        if (watcher_data && (events & PD_EVENT_READ)) {
+         * drain every byte before we accept more.
+         *
+         * Do NOT re-issue when bytes_completed == 0: a zero-byte completion
+         * on a stream socket/handle is end-of-stream (the peer closed).
+         * Re-issuing WSARecv/ReadFile on an EOF'd socket completes
+         * synchronously with 0 bytes and immediately posts another
+         * completion, which we would re-issue again — a tight busy-loop
+         * that floods the connection actor with HANGUP messages until the
+         * pool worker's CancelIoEx catches up. Letting the EOF completion
+         * through without re-arm lets the user callback's HANGUP path
+         * stop the watcher; a later pd_watcher_update can re-arm if the
+         * connection is somehow reused. */
+        if (watcher_data && (events & PD_EVENT_READ) && bytes_completed > 0) {
             DWORD bytes_read = 0;
             memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
             int issued_ok = 0;
@@ -359,7 +378,7 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
             } else {
                 DWORD flags = 0;
                 int rc = WSARecv(
-                    watcher->fd,
+                    (SOCKET)(uintptr_t)(unsigned int)watcher->fd,
                     &watcher_data->wsa_buffer,
                     1,
                     &bytes_read,
@@ -485,7 +504,7 @@ static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
         memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
 
         int rc = WSARecv(
-            watcher->fd,
+            (SOCKET)(uintptr_t)(unsigned int)watcher->fd,
             &watcher_data->wsa_buffer,
             1,
             &bytes_received,
@@ -584,7 +603,7 @@ static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events) {
         } else {
             DWORD flags = 0;
             int rc = WSARecv(
-                watcher->fd,
+                (SOCKET)(uintptr_t)(unsigned int)watcher->fd,
                 &watcher_data->wsa_buffer,
                 1,
                 &bytes_received,
