@@ -64,6 +64,15 @@ typedef struct {
     HANDLE iocp_handle;             /**< IOCP handle */
     OVERLAPPED_ENTRY *events;        /**< Event array for GetQueuedCompletionStatusEx */
     int max_events;                  /**< Maximum events per wait */
+    /* Thread id of the loop thread (the thread running iocp_loop_run). Set
+     * lazily on each iocp_loop_run entry; the single loop thread is the only
+     * writer and the value is idempotent. iocp_watcher_unregister reads it
+     * to detect a call from the loop thread itself, in which case it must
+     * NOT block on iocp_drain_sync (the loop thread is here, not running the
+     * IOCP wait, so the sync completion would never be processed -> deadlock).
+     * A value of 0 means the loop has not run yet, treated as "not the loop
+     * thread" by unregister. */
+    DWORD loop_thread_id;
 } pd_iocp_data_t;
 
 /**
@@ -106,6 +115,13 @@ typedef struct {
     char buffer[4096];              /**< Default buffer for operations */
     int pending_operation;          /**< 0=none, 1=read, 2=write */
     pd_event_t events;              /**< Events being monitored */
+    /* Set non-zero by iocp_watcher_unregister when tearing down a watcher
+     * that has a read in flight (pending_operation == 1). The loop's
+     * dispatch observes it on the final completion for this watcher's
+     * overlapped and frees this struct (and watcher->platform_data) at that
+     * point, instead of unregister freeing it synchronously while the kernel
+     * still holds a pointer to the embedded OVERLAPPED. */
+    volatile int stopping;
     /* Completion state for the most recent async read. Populated by
      * iocp_loop_run from entry->dwNumberOfBytesTransferred. The user
      * callback drains this via pd_watcher_drain_read, after which the
@@ -222,6 +238,10 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
 
     pd_iocp_data_t *data = (pd_iocp_data_t *)loop->platform_data;
 
+    /* Record the loop thread so iocp_watcher_unregister can detect calls
+     * coming from this thread and avoid a deadlocking iocp_drain_sync. */
+    data->loop_thread_id = GetCurrentThreadId();
+
     /* Convert timeout to milliseconds for Windows */
     DWORD win_timeout = timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms;
 
@@ -294,6 +314,23 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
             continue;
         }
 
+        /* Teardown path: iocp_watcher_unregister set `stopping` on a watcher
+         * that had a read in flight and could not free this struct
+         * synchronously (the kernel still holds a pointer to the embedded
+         * OVERLAPPED). This is the final completion for that overlapped —
+         * either the CancelIoEx abort, or a normal read that won the cancel
+         * race. Either way the kernel is now done with the OVERLAPPED, so it
+         * is safe to free. Skip the user callback and any re-arm; the watcher
+         * is already stopped. This check runs before the cancel filter below
+         * so the filter never dereferences a freed lpOverlapped->Internal. */
+        pd_iocp_watcher_data_t *stop_wd = (pd_iocp_watcher_data_t *)watcher->platform_data;
+        if (stop_wd && stop_wd->stopping) {
+            stop_wd->pending_operation = 0;
+            free(stop_wd);
+            watcher->platform_data = NULL;
+            continue;
+        }
+
         /* Check whether the I/O was cancelled (CancelIoEx, pipe close,
          * etc.) before reaching the user. Without this, a cancelled
          * read or write would invoke the callback with a HANGUP/ERROR
@@ -340,6 +377,12 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
          * to preserve edge-triggered semantics: the callback should
          * drain every byte before we accept more.
          *
+         * Re-read platform_data here: the callback may have stopped the
+         * watcher (e.g. its HANGUP path), which frees platform_data and
+         * NULLs watcher->platform_data. The `watcher_data` local captured
+         * above would then be a dangling pointer, so re-bind to the live
+         * value before any dereference.
+         *
          * Do NOT re-issue when bytes_completed == 0: a zero-byte completion
          * on a stream socket/handle is end-of-stream (the peer closed).
          * Re-issuing WSARecv/ReadFile on an EOF'd socket completes
@@ -350,7 +393,9 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
          * through without re-arm lets the user callback's HANGUP path
          * stop the watcher; a later pd_watcher_update can re-arm if the
          * connection is somehow reused. */
-        if (watcher_data && (events & PD_EVENT_READ) && bytes_completed > 0) {
+        watcher_data = (pd_iocp_watcher_data_t *)watcher->platform_data;
+        if (watcher_data && (events & PD_EVENT_READ) && bytes_completed > 0 &&
+            !watcher_data->stopping) {
             DWORD bytes_read = 0;
             memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
             int issued_ok = 0;
@@ -639,30 +684,67 @@ static int iocp_watcher_unregister(pd_watcher_t *watcher) {
         return PD_ERR_INVALID_ARG;
     }
 
-    /* Cancel any pending I/O operations. Use CancelIoEx when we have a
-     * real HANDLE (handle-watchers and any future fd-watchers that have
-     * resolved to one); fall back to CancelIo for the legacy socket path
-     * which still passes a CRT fd. */
+    /* pd_watcher_destroy calls stop then cleanup, both routing here. A
+     * second entry while a deferred free is already in flight must do
+     * nothing — the loop will free platform_data when it processes the
+     * final completion. */
+    if (watcher_data->stopping) {
+        return PD_OK;
+    }
+
+    /* Resolve the HANDLE used to cancel pending I/O: handle-watchers use
+     * watcher->handle directly; socket watchers cast the Winsock SOCKET. */
     HANDLE handle = NULL;
-#ifdef PD_PLATFORM_WINDOWS
-    if (watcher->is_handle && watcher->handle) {
+    if (watcher->is_handle && watcher->handle &&
+            watcher->handle != INVALID_HANDLE_VALUE) {
         handle = (HANDLE)watcher->handle;
-        if (handle != INVALID_HANDLE_VALUE) {
-            CancelIoEx(handle, &watcher_data->overlapped);
-        }
     } else if (watcher->fd >= 0) {
-        HANDLE fd_handle = fd_to_handle(watcher->fd);
-        if (fd_handle && fd_handle != INVALID_HANDLE_VALUE) {
-            CancelIo(fd_handle);
+        handle = fd_to_handle(watcher->fd);
+        if (handle == INVALID_HANDLE_VALUE) {
+            handle = NULL;
         }
     }
-#else
-    (void)handle;
-#endif
 
-    /* Free watcher platform data */
-    free(watcher->platform_data);
-    watcher->platform_data = NULL;
+    /* No read in flight: the kernel holds no pointer to the embedded
+     * OVERLAPPED, so platform_data can be freed synchronously. This covers
+     * the common case where the callback stopped its own watcher
+     * (pending_operation was cleared to 0 in dispatch before the callback
+     * ran) and the teardown case with nothing pending. */
+    if (watcher_data->pending_operation == 0) {
+        free(watcher->platform_data);
+        watcher->platform_data = NULL;
+        return PD_OK;
+    }
+
+    /* A read is in flight: the kernel still references watcher_data->overlapped
+     * and will post one more completion for it (the CancelIoEx abort, or a
+     * normal read that wins the cancel race). Freeing now would leave a
+     * dangling OVERLAPPED the loop later dereferences -> use-after-free.
+     * Mark the watcher stopping and cancel the specific overlapped.
+     * CancelIoEx is cross-thread and per-overlapped; the legacy CancelIo only
+     * cancels I/O issued by the calling thread, which would miss reads issued
+     * by the loop thread, so it is not used here. The loop's stopping-check
+     * frees platform_data when it processes that final completion. */
+    watcher_data->stopping = 1;
+    if (handle != NULL) {
+        CancelIoEx(handle, &watcher_data->overlapped);
+    }
+
+    pd_iocp_data_t *data = (pd_iocp_data_t *)watcher->loop->platform_data;
+    /* If we are NOT on the loop thread, block until the loop has processed
+     * that final completion: iocp_drain_sync posts a sync packet after the
+     * cancel, and IOCP FIFO ordering means the completion posted before the
+     * sync is dequeued first, so the stopping-check has freed platform_data
+     * by the time the sync fires. When drain_sync returns the kernel is done
+     * with the overlapped and the caller may safely free the watcher struct.
+     * If we ARE on the loop thread we must not block (the loop is not running
+     * the IOCP wait, so the sync would never be processed -> deadlock); the
+     * loop frees platform_data on its next completion, and the caller must
+     * keep the watcher struct alive until then. */
+    if (data && data->loop_thread_id != 0 &&
+        GetCurrentThreadId() != data->loop_thread_id) {
+        iocp_drain_sync(watcher->loop);
+    }
 
     return PD_OK;
 }
