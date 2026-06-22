@@ -30,10 +30,35 @@
 
 /* STATUS_CANCELLED is defined in <ntstatus.h>, which conflicts with the
  * regular Win32 headers (it #define's its own error codes). Define the
- * value inline so we can check the Internal field of an OVERLAPPED
+ * values inline so we can check the Internal field of an OVERLAPPED
  * without pulling in the full NT status surface. */
 #ifndef STATUS_CANCELLED
-#define STATUS_CANCELLED ((DWORD)0xC0000120L)
+#define STATUS_CANCELLED        ((DWORD)0xC0000120L)
+#endif
+/* NT status codes used to classify read completions into READ / HANGUP /
+ * ERROR. STATUS_SUCCESS with >0 bytes is data; STATUS_SUCCESS with 0 bytes
+ * is a clean end-of-stream (peer closed); any failure status (connection
+ * reset, pipe broken, etc.) is an error. */
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS          ((DWORD)0x00000000L)
+#endif
+#ifndef STATUS_END_OF_FILE
+#define STATUS_END_OF_FILE       ((DWORD)0xC0000011L)
+#endif
+#ifndef STATUS_CONNECTION_RESET
+#define STATUS_CONNECTION_RESET  ((DWORD)0xC000020DL)
+#endif
+#ifndef STATUS_LOCAL_DISCONNECT
+#define STATUS_LOCAL_DISCONNECT  ((DWORD)0xC000020EL)
+#endif
+#ifndef STATUS_NETNAME_DELETED
+#define STATUS_NETNAME_DELETED   ((DWORD)0xC0000034L)
+#endif
+#ifndef STATUS_PIPE_BROKEN
+#define STATUS_PIPE_BROKEN       ((DWORD)0xC000014BL)
+#endif
+#ifndef STATUS_PORT_DISCONNECTED
+#define STATUS_PORT_DISCONNECTED ((DWORD)0xC0000037L)
 #endif
 
 /**
@@ -351,15 +376,33 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
         pd_event_t events = PD_EVENT_NONE;
         DWORD bytes_completed = entry->dwNumberOfBytesTransferred;
 
-        /* Determine what event completed */
+        /* Determine what event completed. `io_error` is the NT status from
+         * the overlapped's Internal field (read above the cancel filter).
+         * Classify read completions by status + byte count so EOF and
+         * errored reads reach the user as HANGUP/ERROR rather than a bare
+         * READ with 0 bytes. */
         pd_iocp_watcher_data_t *watcher_data = (pd_iocp_watcher_data_t *)watcher->platform_data;
         if (watcher_data) {
             if (watcher_data->pending_operation == 1) {
-                events |= PD_EVENT_READ;
-                /* Stash the read bytes so the user callback can drain
-                 * them via pd_watcher_drain_read. The kernel has already
-                 * delivered them into watcher_data->buffer. */
-                watcher_data->bytes_available = bytes_completed;
+                if (io_error == STATUS_SUCCESS) {
+                    if (bytes_completed > 0) {
+                        events |= PD_EVENT_READ;
+                        /* Stash the read bytes so the user callback can
+                         * drain them via pd_watcher_drain_read. The kernel
+                         * has already delivered them into buffer. */
+                        watcher_data->bytes_available = bytes_completed;
+                    } else {
+                        /* 0 bytes with STATUS_SUCCESS: clean end-of-stream
+                         * (the peer closed). Report HANGUP so the user's
+                         * disconnect path runs; do not set bytes_available
+                         * (nothing to drain). */
+                        events |= PD_EVENT_HANGUP;
+                    }
+                } else {
+                    /* Any failure NT status (connection reset, pipe broken,
+                     * netname deleted, etc.): report ERROR. */
+                    events |= PD_EVENT_ERROR;
+                }
             } else if (watcher_data->pending_operation == 2) {
                 events |= PD_EVENT_WRITE;
             }

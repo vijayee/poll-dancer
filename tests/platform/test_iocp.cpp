@@ -127,6 +127,60 @@ TEST_F(IocpTest, SocketMonitoring) {
     pd_loop_destroy(loop);
 }
 
+/* Test: a peer close is delivered as PD_EVENT_HANGUP, not a bare READ with
+ * 0 bytes. This gates the #1 event-classification fix. */
+TEST_F(IocpTest, PeerCloseDeliveredAsHangup) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    SOCKET cli = INVALID_SOCKET, srv = INVALID_SOCKET;
+    ASSERT_NO_FATAL_FAILURE(make_loopback_pair(&cli, &srv));
+
+    CallbackLog log;
+    pd_watcher_t *watcher = pd_watcher_create(loop, (int)srv,
+                                               PD_EVENT_READ, logging_callback,
+                                               &log);
+    ASSERT_NE(watcher, nullptr);
+
+    std::thread loop_thread([&] { pd_loop_run(loop); });
+
+    /* Send some data, let the loop process it, then close the peer. */
+    const char msg[] = "hello";
+    ASSERT_EQ(send(cli, msg, (int)sizeof(msg) - 1, 0), (int)(sizeof(msg) - 1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_EQ(closesocket(cli), 0);
+    cli = INVALID_SOCKET;
+
+    /* Wait (up to ~1s) for the HANGUP to arrive. */
+    for (int i = 0; i < 100 && !log.saw_hangup.load(); i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    pd_loop_stop(loop);
+    loop_thread.join();
+
+    EXPECT_TRUE(log.saw_hangup.load())
+        << "expected a HANGUP event on peer close";
+
+    /* The event stream should contain at least one READ (the "hello") before
+     * the HANGUP, and the HANGUP must not carry drained bytes. */
+    auto evs = log.snapshot();
+    ASSERT_GE(evs.size(), 1u);
+    bool saw_read = false;
+    for (size_t i = 0; i < evs.size(); i++) {
+        if (evs[i] & PD_EVENT_READ) saw_read = true;
+        if (evs[i] & PD_EVENT_HANGUP) {
+            EXPECT_EQ(log.drained[i], 0u) << "HANGUP must not deliver bytes";
+        }
+    }
+    EXPECT_TRUE(saw_read) << "expected a READ event for the data";
+
+    pd_watcher_destroy(watcher);
+    if (cli != INVALID_SOCKET) closesocket(cli);
+    if (srv != INVALID_SOCKET) closesocket(srv);
+    pd_loop_destroy(loop);
+}
+
 /* Test: stop a watcher while a read is in flight (no data yet) from a thread
  * OTHER than the loop thread, then destroy it. This exercises the #2 deferred
  * free + iocp_drain_sync path: unregister must not free the platform data
