@@ -138,7 +138,7 @@ typedef struct {
     OVERLAPPED overlapped;          /**< Overlapped structure for async I/O */
     WSABUF wsa_buffer;              /**< Buffer for async operations */
     char buffer[4096];              /**< Default buffer for operations */
-    int pending_operation;          /**< 0=none, 1=read, 2=write */
+    int pending_operation;          /**< 0=none, 1=read in flight */
     pd_event_t events;              /**< Events being monitored */
     /* Set non-zero by iocp_watcher_unregister when tearing down a watcher
      * that has a read in flight (pending_operation == 1). The loop's
@@ -356,10 +356,36 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
             continue;
         }
 
+        /* Write-completion demux. A completion whose lpOverlapped is not the
+         * backend's read overlapped (&watcher_data->overlapped) is a write the
+         * CALLER issued directly on this IOCP-bound handle (WriteFile/WSASend
+         * with the caller's own OVERLAPPED). The backend never issues
+         * overlapped writes itself, so any non-read overlapped is a client
+         * write. Deliver it as PD_EVENT_WRITE; the caller reads bytes/status
+         * via GetOverlappedResult on its own OVERLAPPED. Do NOT touch
+         * pending_operation (a read may still be in flight on the read
+         * overlapped) and do NOT re-arm a read below — a write completion must
+         * never disturb read state.
+         *
+         * This runs before the cancel filter below so a cancelled write is
+         * reported as WRITE (the caller's GetOverlappedResult surfaces the
+         * error) rather than being swallowed and clobbering the read's
+         * pending_operation. Callers that issue overlapped writes must drain
+         * them before stopping the watcher: a write completion arriving once
+         * `stopping` is set is dropped by the stopping-check above (the
+         * caller's wait then times out). */
+        pd_iocp_watcher_data_t *write_wd =
+            (pd_iocp_watcher_data_t *)watcher->platform_data;
+        if (write_wd && entry->lpOverlapped != &write_wd->overlapped) {
+            watcher->callback(loop, watcher, PD_EVENT_WRITE, watcher->user_data);
+            continue;
+        }
+
         /* Check whether the I/O was cancelled (CancelIoEx, pipe close,
-         * etc.) before reaching the user. Without this, a cancelled
-         * read or write would invoke the callback with a HANGUP/ERROR
-         * event that's really just our own teardown surfacing. */
+         * etc.) before reaching the user. Only read completions reach here:
+         * client-issued write completions are handled by the demux above. A
+         * cancelled read would otherwise invoke the callback with a
+         * HANGUP/ERROR event that's really just our own teardown surfacing. */
         DWORD io_error = (DWORD)(ULONG_PTR)entry->lpOverlapped->Internal;
         if (entry->lpOverlapped->Internal == STATUS_CANCELLED ||
             io_error == ERROR_OPERATION_ABORTED) {
@@ -403,9 +429,9 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
                      * netname deleted, etc.): report ERROR. */
                     events |= PD_EVENT_ERROR;
                 }
-            } else if (watcher_data->pending_operation == 2) {
-                events |= PD_EVENT_WRITE;
             }
+            /* pending_operation tracks reads only; write completions are
+             * demuxed by overlapped pointer above and never reach here. */
             watcher_data->pending_operation = 0;
         }
 
@@ -437,6 +463,9 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
          * stop the watcher; a later pd_watcher_update can re-arm if the
          * connection is somehow reused. */
         watcher_data = (pd_iocp_watcher_data_t *)watcher->platform_data;
+        /* Re-arm a READ only. Write completions `continue` in the demux above
+         * and never reach here, so this block never re-issues a read on top of
+         * a still-pending read or disturbs a concurrent write's overlapped. */
         if (watcher_data && (events & PD_EVENT_READ) && bytes_completed > 0 &&
             !watcher_data->stopping) {
             DWORD bytes_read = 0;
@@ -656,12 +685,17 @@ static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events) {
     watcher_data->events = events;
     watcher->events = events;
 
-    /* Re-issue operations for the new event mask. IOCP only drives READ
-     * through the overlapped machinery; the user does synchronous writes
-     * from the callback. So WRITE is a no-op here on both the socket and
-     * the HANDLE path. The re-issue uses ReadFile for HANDLE watchers
-     * and WSARecv for socket watchers; calling WSARecv on a HANDLE
-     * watcher would pass fd=-1, which is a hard error. */
+    /* Re-issue operations for the new event mask. IOCP drives READ through
+     * the overlapped machinery; WRITE completions are delivered for overlapped
+     * writes the CALLER issues directly on this IOCP-bound handle (WriteFile/
+     * WSASend with the caller's own OVERLAPPED), demuxed in iocp_loop_run by
+     * overlapped pointer. The backend never issues overlapped writes itself,
+     * so arming PD_EVENT_WRITE here issues no I/O — it only records intent in
+     * the event mask. Callers that want overlapped-write completions must issue
+     * their own overlapped WriteFile/WSASend on the registered handle. The
+     * re-issue below uses ReadFile for HANDLE watchers and WSARecv for socket
+     * watchers; calling WSARecv on a HANDLE watcher would pass fd=-1, which is
+     * a hard error. */
     if (events & PD_EVENT_READ && watcher_data->pending_operation == 0) {
         DWORD bytes_received = 0;
         memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
