@@ -9,6 +9,7 @@
 #ifndef POLL_DANCER_TYPES_H
 #define POLL_DANCER_TYPES_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
