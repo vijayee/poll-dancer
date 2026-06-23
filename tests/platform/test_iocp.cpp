@@ -92,6 +92,49 @@ static void make_loopback_pair(SOCKET *out_client, SOCKET *out_server) {
     *out_server = srv_conn;
 }
 
+/* Build a connected named-pipe pair (client, server), both opened with
+ * FILE_FLAG_OVERLAPPED and PIPE_WAIT. The CLIENT handle is the one the test
+ * registers with the loop (so overlapped I/O on it completes to the loop's
+ * IOCP port, mirroring the offs_client transport); the SERVER handle is the
+ * peer used to drive a read completion on the client. */
+static void make_pipe_pair(HANDLE *out_client, HANDLE *out_server) {
+    const char *name = "\\\\.\\pipe\\pd-test-iocp-write";
+    HANDLE srv = CreateNamedPipeA(
+        name,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 4096, 4096, 0, NULL);
+    ASSERT_NE(srv, INVALID_HANDLE_VALUE);
+
+    HANDLE cli = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        cli = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                          OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+        if (cli != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_PIPE_BUSY) break;
+        WaitNamedPipeA(name, 100);
+    }
+    ASSERT_NE(cli, INVALID_HANDLE_VALUE);
+
+    /* Complete the server-side connect (overlapped). The client's CreateFile
+     * may have already connected the instance, in which case ConnectNamedPipe
+     * returns ERROR_PIPE_CONNECTED (232). */
+    OVERLAPPED cov = {};
+    BOOL ok = ConnectNamedPipe(srv, &cov);
+    if (!ok) {
+        DWORD err = GetLastError();
+        ASSERT_TRUE(err == ERROR_IO_PENDING || err == ERROR_PIPE_CONNECTED)
+            << "ConnectNamedPipe err=" << err;
+        if (err == ERROR_IO_PENDING) {
+            DWORD bytes = 0;
+            ASSERT_TRUE(GetOverlappedResult(srv, &cov, &bytes, TRUE));
+        }
+    }
+
+    *out_client = cli;
+    *out_server = srv;
+}
+
 /* Fixture: initialize Winsock for each test. poll-dancer does not call
  * WSAStartup itself, so the test must. */
 class IocpTest : public ::testing::Test {
@@ -216,5 +259,109 @@ TEST_F(IocpTest, StopWhileReadPendingFromOtherThread) {
 
     closesocket(cli);
     closesocket(srv);
+    pd_loop_destroy(loop);
+}
+
+/* Test: a client-issued overlapped WriteFile on an IOCP-bound handle is
+ * delivered to the watcher callback as PD_EVENT_WRITE (not misclassified as
+ * READ with the write's byte count), and a read armed on the same handle stays
+ * in flight across the write completion. This gates the overlapped-async
+ * named-pipe write path: the offs_client issues WriteFile with its own
+ * OVERLAPPED on the pipe handle that the recv-thread loop already monitors for
+ * reads, so the write completion lands in iocp_loop_run and must be demuxed by
+ * overlapped pointer (not by the watcher's pending_operation). The handle is
+ * IOCP-bound, so the caller cannot wait on the overlapped's hEvent; it reads
+ * the result via GetOverlappedResult(bWait=FALSE) after the loop drains the
+ * completion. Run under --gtest_repeat to stress the demux + read-in-flight
+ * interaction. */
+TEST_F(IocpTest, WriteCompletionDelivered) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    HANDLE cli = INVALID_HANDLE_VALUE, srv = INVALID_HANDLE_VALUE;
+    ASSERT_NO_FATAL_FAILURE(make_pipe_pair(&cli, &srv));
+
+    CallbackLog log;
+    /* Register the CLIENT handle (the IOCP-bound one) for READ|WRITE.
+     * Registration issues a ReadFile, so a read is in flight when the write
+     * below is issued — exactly the case that would corrupt the read path if
+     * the write completion were classified by pending_operation. */
+    pd_watcher_t *watcher = pd_watcher_create_for_handle(
+        loop, (void *)cli,
+        static_cast<pd_event_t>(PD_EVENT_READ | PD_EVENT_WRITE),
+        logging_callback, &log);
+    ASSERT_NE(watcher, nullptr);
+
+    std::thread loop_thread([&] { pd_loop_run(loop); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    /* Issue an overlapped WriteFile on the client handle with a caller-owned
+     * OVERLAPPED. The completion is posted to the loop's IOCP port (the handle
+     * is bound there), not signaled via hEvent. */
+    const char msg[] = "overlapped-write";
+    const DWORD msg_len = (DWORD)(sizeof(msg) - 1);
+    OVERLAPPED wov = {};
+    DWORD written = 0;
+    BOOL ok = WriteFile(cli, msg, msg_len, &written, &wov);
+    if (!ok) {
+        DWORD err = GetLastError();
+        ASSERT_TRUE(err == ERROR_IO_PENDING || err == ERROR_MORE_DATA)
+            << "WriteFile err=" << err;
+    }
+
+    /* Wait (up to ~1s) for the loop to deliver PD_EVENT_WRITE. */
+    bool saw_write = false;
+    for (int i = 0; i < 100; i++) {
+        auto evs = log.snapshot();
+        for (auto ev : evs) {
+            if (ev & PD_EVENT_WRITE) saw_write = true;
+        }
+        if (saw_write) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(saw_write) << "expected a PD_EVENT_WRITE completion";
+
+    /* The loop has dequeued the completion, so the kernel has finalized the
+     * OVERLAPPED; GetOverlappedResult(bWait=FALSE) returns the byte count. */
+    DWORD bytes = 0;
+    BOOL gor = GetOverlappedResult(cli, &wov, &bytes, FALSE);
+    EXPECT_TRUE(gor) << "GetOverlappedResult failed err=" << GetLastError();
+    EXPECT_EQ(bytes, msg_len);
+
+    /* Read-non-regression: the read armed at registration must still be in
+     * flight. Drive it by writing from the peer (server) handle; the client's
+     * pending ReadFile completes and the callback logs a READ with the bytes. */
+    const char reply[] = "peer-reply";
+    const DWORD reply_len = (DWORD)(sizeof(reply) - 1);
+    DWORD swritten = 0;
+    ASSERT_TRUE(WriteFile(srv, reply, reply_len, &swritten, nullptr))
+        << "server WriteFile err=" << GetLastError();
+    ASSERT_EQ(swritten, reply_len);
+
+    bool saw_read = false;
+    for (int i = 0; i < 100; i++) {
+        auto evs = log.snapshot();
+        for (size_t i2 = 0; i2 < evs.size(); i2++) {
+            if ((evs[i2] & PD_EVENT_READ) && log.drained[i2] == reply_len) {
+                saw_read = true;
+            }
+        }
+        if (saw_read) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(saw_read) << "read was corrupted by the write completion";
+
+    /* Destroy the watcher BEFORE stopping the loop: the read re-armed after
+     * the peer reply is still in flight, so iocp_watcher_unregister takes the
+     * deferred-free + iocp_drain_sync path, which needs a live loop thread to
+     * process the CancelIoEx abort. Destroying after join would hit the
+     * drain_sync 5s timeout (no loop thread to drain). pd_watcher_destroy
+     * drops watcher_count to 0, so pd_loop_run exits on its own. */
+    pd_watcher_destroy(watcher);
+    pd_loop_stop(loop);
+    loop_thread.join();
+
+    CloseHandle(cli);
+    CloseHandle(srv);
     pd_loop_destroy(loop);
 }
