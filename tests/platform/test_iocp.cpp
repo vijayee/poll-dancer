@@ -365,3 +365,101 @@ TEST_F(IocpTest, WriteCompletionDelivered) {
     CloseHandle(srv);
     pd_loop_destroy(loop);
 }
+
+/* Test: WSASend-on-Winsock-SOCKET variant of WriteCompletionDelivered. This
+ * gates the offs_client AF_UNIX/TCP overlapped write path: the recv-thread loop
+ * binds the transport SOCKET to its IOCP port via pd_watcher_create (which
+ * issues WSARecv at registration), and the client issues WSASend with its own
+ * OVERLAPPED on that same socket. The completion must be demuxed by overlapped
+ * pointer and delivered as PD_EVENT_WRITE — the same dispatch code path as the
+ * pipe variant, since the IOCP demux is handle-agnostic. The loopback pair is
+ * TCP, so this also verifies WSASend-on-TCP-socket directly (the offs_client
+ * TCP transport uses the identical WSASend branch in _raw_send).
+ *
+ * A read is in flight at registration (WSARecv), so issuing the write while a
+ * read is pending is exactly the case that would corrupt the read path if the
+ * write completion were classified by pending_operation; the demux branches on
+ * the overlapped pointer and `continue`s before touching read state, so the
+ * registration WSARecv stays pending across the write. Concurrent read/write
+ * non-disturbance is exercised end-to-end by the liboffs TestOffsClient AF_UNIX
+ * client (reads and writes interleave on the same IOCP-bound socket), so this
+ * unit test does not drive a second read completion before teardown.
+ *
+ * Teardown is deterministic: the registration WSARecv never completed (no peer
+ * reply was sent), so it is still in flight (pending_operation==1) at
+ * pd_watcher_destroy. iocp_watcher_unregister then takes the stopping +
+ * CancelIoEx + iocp_drain_sync path, which needs a live loop thread — destroy
+ * BEFORE pd_loop_stop. Driving a read completion before destroy would race the
+ * loop's read re-arm against a cross-thread unregister's fast-path free (a
+ * pre-existing poll-dancer issue that also makes the pipe variant's
+ * read-non-regression teardown timing-dependent); leaving the registration read
+ * pending avoids it. */
+TEST_F(IocpTest, WriteCompletionDeliveredSocket) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    SOCKET cli = INVALID_SOCKET, srv = INVALID_SOCKET;
+    ASSERT_NO_FATAL_FAILURE(make_loopback_pair(&cli, &srv));
+
+    CallbackLog log;
+    pd_watcher_t *watcher = pd_watcher_create(
+        loop, (int)cli,
+        static_cast<pd_event_t>(PD_EVENT_READ | PD_EVENT_WRITE),
+        logging_callback, &log);
+    ASSERT_NE(watcher, nullptr);
+
+    std::thread loop_thread([&] { pd_loop_run(loop); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    /* Issue an overlapped WSASend on the client socket with a caller-owned
+     * OVERLAPPED (hEvent left NULL — completions go to the IOCP port, never
+     * signaled via an event). WSASend returns 0 on immediate completion (the
+     * completion is still queued to the bound port) or SOCKET_ERROR with
+     * WSAGetLastError()==WSA_IO_PENDING when it pends. */
+    char msg[] = "overlapped-wsasend";
+    const int msg_len = (int)(sizeof(msg) - 1);
+    WSABUF wbuf;
+    wbuf.buf = msg;
+    wbuf.len = (ULONG)msg_len;
+    OVERLAPPED wov = {};
+    DWORD sent = 0;
+    int rc = WSASend(cli, &wbuf, 1, &sent, 0, &wov, nullptr);
+    if (rc == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        ASSERT_EQ(err, WSA_IO_PENDING) << "WSASend err=" << err;
+    }
+
+    /* Wait (up to ~1s) for the loop to deliver PD_EVENT_WRITE. */
+    bool saw_write = false;
+    for (int i = 0; i < 100; i++) {
+        auto evs = log.snapshot();
+        for (auto ev : evs) {
+            if (ev & PD_EVENT_WRITE) saw_write = true;
+        }
+        if (saw_write) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(saw_write) << "expected a PD_EVENT_WRITE completion";
+
+    /* The loop has dequeued the completion, so the kernel has finalized the
+     * OVERLAPPED; WSAGetOverlappedResult(bWait=FALSE) returns the byte count
+     * (fWait=FALSE is the correct mode for an IOCP-completed operation). */
+    DWORD bytes = 0;
+    DWORD flags = 0;
+    BOOL gor = WSAGetOverlappedResult(cli, &wov, &bytes, FALSE, &flags);
+    EXPECT_TRUE(gor) << "WSAGetOverlappedResult failed err=" << WSAGetLastError();
+    EXPECT_EQ(bytes, (DWORD)msg_len);
+
+    /* Destroy BEFORE pd_loop_stop: the registration WSARecv is still in flight
+     * (pending_operation==1), so iocp_watcher_unregister takes the stopping +
+     * CancelIoEx + iocp_drain_sync path, which needs a live loop thread to
+     * process the abort + sync. See the test header for why no read completion
+     * is driven before this point. */
+    pd_watcher_destroy(watcher);
+    pd_loop_stop(loop);
+    loop_thread.join();
+
+    closesocket(cli);
+    closesocket(srv);
+    pd_loop_destroy(loop);
+}
