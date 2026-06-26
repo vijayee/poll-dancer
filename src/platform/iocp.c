@@ -1127,13 +1127,24 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
             timer_data->queue_timer = NULL;
             timer_data->started = 0;
         }
-        /* Close the stop event handle */
+        /* Close the stop event handle. The completion dispatcher reads only
+         * timer_data->destroyed (never stop_event), so closing it here — before
+         * the drain — is safe. */
         if (timer_data->stop_event != NULL) {
             CloseHandle(timer_data->stop_event);
             timer_data->stop_event = NULL;
         }
-        free(timer_data);
-        timer->platform_data = NULL;
+        /* Do NOT free timer_data / clear platform_data yet. The loop thread may
+         * be mid-dispatch of a queued timer completion: it has already read
+         * td = timer->platform_data (in the PD_IOCP_TIMER_KEY branch of
+         * iocp_loop_run) and is about to dereference td->destroyed. Freeing
+         * here would turn that into a use-after-free.
+         * Defer the free to after iocp_drain_sync, which is a barrier: once it
+         * returns the loop has drained every queued completion for this timer
+         * (no new ones can arrive — DeleteTimerQueueTimer above cancelled the
+         * queue timer), so no loop thread holds a stale td pointer. The
+         * dispatcher observes destroyed==1 on LIVE memory and skips the user
+         * callback. */
     }
 
     /* Drain any in-flight completion packets BEFORE freeing the
@@ -1145,6 +1156,15 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
      * pd_loop_run_once. */
     if (timer->loop && timer->watcher) {
         iocp_drain_sync(timer->loop);
+    }
+
+    /* The drain barrier has now guaranteed no loop thread is mid-dispatch of a
+     * timer completion for this timer, so freeing timer_data and clearing
+     * platform_data is safe. */
+    if (timer->platform_data) {
+        pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
+        free(timer_data);
+        timer->platform_data = NULL;
     }
 
     /* Remove the placeholder watcher from the loop's watcher list and free it.
