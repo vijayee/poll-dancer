@@ -613,9 +613,9 @@ static int kqueue_timer_stop(pd_timer_t *timer) {
     return PD_OK;
 }
 
-static void kqueue_timer_destroy(pd_timer_t *timer) {
+static int kqueue_timer_destroy(pd_timer_t *timer) {
     if (!timer) {
-        return;
+        return 1;
     }
 
     /* Free platform data */
@@ -634,4 +634,7 @@ static void kqueue_timer_destroy(pd_timer_t *timer) {
         free(timer->watcher);
         timer->watcher = NULL;
     }
+    /* kqueue dispatches timers via EV_DELETE'd kevents; nothing queued can
+     * outlive destroy, so the struct is always safe to free. */
+    return 1;
 }

@@ -45,7 +45,13 @@ typedef struct pd_platform_ops {
     int (*timer_create)(struct pd_loop *loop, struct pd_timer *timer);
     int (*timer_start)(struct pd_timer *timer);
     int (*timer_stop)(struct pd_timer *timer);
-    void (*timer_destroy)(struct pd_timer *timer);
+    /* Tear the timer's platform resources down. Returns 1 when no loop
+     * thread can still reach this timer (the normal case) and pd_timer_destroy
+     * may free the pd_timer_t struct; returns 0 when a queued completion may
+     * still be pending on the loop — the loop thread dereferences lpOverlapped
+     * (the pd_timer_t*) and timer->platform_data in its dispatcher — so the
+     * struct and its platform_data must leak instead of being freed. */
+    int (*timer_destroy)(struct pd_timer *timer);
 
     /* Platform info */
     const char *name;       /**< Platform name (e.g., "epoll", "kqueue", "iocp") */

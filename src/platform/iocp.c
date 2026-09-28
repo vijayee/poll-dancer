@@ -168,7 +168,7 @@ static int iocp_async_send(pd_loop_t *loop, void *data);
 static int iocp_timer_create(pd_loop_t *loop, pd_timer_t *timer);
 static int iocp_timer_start(pd_timer_t *timer);
 static int iocp_timer_stop(pd_timer_t *timer);
-static void iocp_timer_destroy(pd_timer_t *timer);
+static int iocp_timer_destroy(pd_timer_t *timer);
 
 /* Platform operations */
 const pd_platform_ops_t pd_platform_iocp = {
@@ -553,16 +553,21 @@ static int iocp_loop_stop(pd_loop_t *loop) {
  * the IOCP preserves FIFO ordering for PostQueuedCompletionStatus packets
  * posted to the same handle, every completion the dispatcher cared about
  * has been processed by the time the event fires.
+ *
+ * Returns 1 when the loop consumed the sync packet (the drain succeeded),
+ * 0 when the 5s wait timed out or the packet could not be posted — the
+ * caller must then NOT free memory the loop thread may still be about to
+ * dereference (a timed-out drain voids the ordering guarantee above).
  */
-static void iocp_drain_sync(pd_loop_t *loop) {
+static int iocp_drain_sync(pd_loop_t *loop) {
     if (!loop || !loop->platform_data) {
-        return;
+        return 0;
     }
     pd_iocp_data_t *data = (pd_iocp_data_t *)loop->platform_data;
     pd_iocp_sync_t sync = {0};
     sync.event = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (sync.event == NULL) {
-        return;
+        return 0;
     }
     /* Post AFTER any earlier completion packets the loop might still be
      * holding in its `events` buffer or processing. FIFO ordering
@@ -574,8 +579,9 @@ static void iocp_drain_sync(pd_loop_t *loop) {
         PD_IOCP_SYNC_KEY,
         (OVERLAPPED *)&sync
     );
-    WaitForSingleObject(sync.event, 5000);
+    int consumed = (WaitForSingleObject(sync.event, 5000) == WAIT_OBJECT_0);
     CloseHandle(sync.event);
+    return consumed;
 }
 
 static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
@@ -1108,9 +1114,9 @@ static int iocp_timer_stop(pd_timer_t *timer) {
     return PD_OK;
 }
 
-static void iocp_timer_destroy(pd_timer_t *timer) {
+static int iocp_timer_destroy(pd_timer_t *timer) {
     if (!timer) {
-        return;
+        return 1;
     }
 
     /* Stop the timer if running, using INVALID_HANDLE_VALUE to wait for
@@ -1154,14 +1160,20 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
      * via lpOverlapped. Wait for the loop to consume them; otherwise the
      * loop thread would dereference a freed pointer when it next runs
      * pd_loop_run_once. */
+    /* Free timer_data ONLY when the drain consumed the sync packet. A
+     * timed-out drain means the loop thread has not yet processed this
+     * timer's queued completion and may still dereference both
+     * timer->platform_data (the PD_IOCP_TIMER_KEY branch reads
+     * td->destroyed on it) and the pd_timer_t struct itself (it is the
+     * completion's lpOverlapped). Return 0 in that case so pd_timer_destroy
+     * skips free(timer): the struct and its timer_data leak deliberately —
+     * a leak is recoverable, a use-after-free is not. On live leaked memory
+     * the dispatcher still observes destroyed==1 and skips the callback. */
+    int drained = 0;
     if (timer->loop && timer->watcher) {
-        iocp_drain_sync(timer->loop);
+        drained = iocp_drain_sync(timer->loop);
     }
-
-    /* The drain barrier has now guaranteed no loop thread is mid-dispatch of a
-     * timer completion for this timer, so freeing timer_data and clearing
-     * platform_data is safe. */
-    if (timer->platform_data) {
+    if (drained && timer->platform_data) {
         pd_iocp_timer_data_t *timer_data = (pd_iocp_timer_data_t *)timer->platform_data;
         free(timer_data);
         timer->platform_data = NULL;
@@ -1177,6 +1189,7 @@ static void iocp_timer_destroy(pd_timer_t *timer) {
         free(timer->watcher);
         timer->watcher = NULL;
     }
+    return drained;
 }
 
 #else /* !PD_PLATFORM_WINDOWS */

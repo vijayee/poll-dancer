@@ -534,9 +534,9 @@ static int epoll_timer_stop(pd_timer_t *timer) {
     return PD_OK;
 }
 
-static void epoll_timer_destroy(pd_timer_t *timer) {
+static int epoll_timer_destroy(pd_timer_t *timer) {
     if (!timer) {
-        return;
+        return 1;
     }
 
     /* Close the timerfd */
@@ -548,4 +548,7 @@ static void epoll_timer_destroy(pd_timer_t *timer) {
         free(timerfd_ptr);
         timer->platform_data = NULL;
     }
+    /* epoll dispatches timers synchronously off the fd; no queued completion
+     * can outlive destroy, so the struct is always safe to free. */
+    return 1;
 }
