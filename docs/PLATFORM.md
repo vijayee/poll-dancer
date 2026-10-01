@@ -142,6 +142,31 @@ Callers that hold their own locks must also never hold them across
 a circular wait (this exact shape caused the timer-actor stall documented in
 the liboffs docs, `backpressure-and-timer-stall.md`).
 
+### Watcher Unregister Ownership
+
+On epoll and kqueue, `watcher_unregister` deletes the kernel membership for a
+fd/ident **by number**. That is only safe while the unregistering watcher is
+still its ident's current registration: a watcher whose fd was closed and
+whose number the kernel recycled for a new file — for example a server's
+accepted connection after a client reconnects quickly — must not delete the
+NEW owner's registration, or the new file is silently removed from the event
+loop and never read again (observed as the liboffs/OFFS daemon's accepted CLI
+connections going permanently unread; the deferred-teardown destroy stacks
+amplify the window because the DEL lands long after the fd was reused).
+
+Both backends therefore keep a record of live registrations
+(`{ident, watcher}` in the loop's platform data):
+
+- `watcher_register` evicts any record naming the same ident held by a
+  DIFFERENT watcher (the kernel-side membership the stale record described is
+  already gone — it dies with the fd's last reference) and records the new
+  one.
+- `watcher_unregister` only issues the DEL when ITS watcher still holds the
+  ident's record; otherwise it skips the kernel delete and just releases the
+  watcher's platform data.
+- IOCP is handle-based (completion keyed by lpOverlapped, not by fd number)
+  and does not record registrations.
+
 ## Platform Detection
 
 The library automatically detects the platform at compile time:

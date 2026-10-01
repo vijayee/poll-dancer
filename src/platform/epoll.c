@@ -21,13 +21,26 @@
 #include <sys/eventfd.h>
 
 /**
- * Platform-specific data for epoll.
+ * One live registration: the watcher that currently owns a given fd in this
+ * loop's epoll set. Unregistration consults it by WATCHER IDENTITY, not fd
+ * value — a watcher torn down after its fd was closed and recycled by a new
+ * connection must not delete the new owner's registration (unregistering by
+ * fd alone is how a deferred teardown kills an accepted-but-never-read
+ * connection).
  */
+typedef struct {
+    int fd;
+    pd_watcher_t *watcher;
+} pd_epoll_registration_t;
+
 typedef struct {
     int epoll_fd;                    /**< epoll file descriptor */
     struct epoll_event *events;      /**< Event array for epoll_wait */
     int max_events;                  /**< Maximum events per wait */
     int eventfd_fd;                  /**< eventfd for async wake-up */
+    pd_epoll_registration_t *registrations;  /**< Live fd -> watcher registrations */
+    size_t registration_count;
+    size_t registration_capacity;
 } pd_epoll_data_t;
 
 /**
@@ -50,7 +63,7 @@ static int epoll_async_send(pd_loop_t *loop, void *data);
 static int epoll_timer_create(pd_loop_t *loop, pd_timer_t *timer);
 static int epoll_timer_start(pd_timer_t *timer);
 static int epoll_timer_stop(pd_timer_t *timer);
-static void epoll_timer_destroy(pd_timer_t *timer);
+static int epoll_timer_destroy(pd_timer_t *timer);
 
 /**
  * HANDLE-based watcher registration is a Windows-only feature. On POSIX
@@ -205,6 +218,7 @@ static void epoll_loop_destroy(pd_loop_t *loop) {
     }
 
     free(data->events);
+    free(data->registrations);
     free(data);
     loop->platform_data = NULL;
 }
@@ -272,6 +286,23 @@ static int epoll_loop_stop(pd_loop_t *loop) {
     return PD_OK;
 }
 
+/* Drop the (stale) registration record for this watcher's fd if it names a
+   different watcher. The kernel-side registration it describes is either
+   already gone (the fd was closed — epoll membership dies with the last
+   reference) or belongs to whoever re-registered, so nothing is DEL'ed on
+   eviction. */
+static void _epoll_evict_stale_registration(pd_epoll_data_t *data, int fd,
+                                            pd_watcher_t *watcher) {
+    for (size_t i = 0; i < data->registration_count; i++) {
+        if (data->registrations[i].fd == fd &&
+            data->registrations[i].watcher != watcher) {
+            data->registrations[i] = data->registrations[data->registration_count - 1];
+            data->registration_count--;
+            return;
+        }
+    }
+}
+
 static int epoll_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
     if (!loop || !watcher) {
         return PD_ERR_INVALID_ARG;
@@ -293,6 +324,10 @@ static int epoll_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
     watcher_data->epoll_event.events = events_to_epoll(watcher->events);
     watcher_data->epoll_event.data.ptr = watcher;
 
+    /* A previous watcher of this (possibly recycled) fd may still hold a
+       registration record; evict it so our own record is the fd's only one. */
+    _epoll_evict_stale_registration(data, watcher->fd, watcher);
+
     /* Add to epoll */
     int result = epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, watcher->fd, &watcher_data->epoll_event);
     if (result < 0) {
@@ -300,6 +335,28 @@ static int epoll_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
         free(watcher_data);
         return PD_ERR_SYSTEM;
     }
+
+    /* Record the registration */
+    if (data->registration_count >= data->registration_capacity) {
+        size_t new_cap = data->registration_capacity == 0
+            ? 8 : data->registration_capacity * 2;
+        pd_epoll_registration_t *grown =
+            realloc(data->registrations, new_cap * sizeof(pd_epoll_registration_t));
+        if (!grown) {
+            /* The fd is registered in the kernel but we cannot track it —
+               fail the registration so the caller knows the watcher is
+               unusable, and undo the kernel-side membership. */
+            epoll_ctl(data->epoll_fd, EPOLL_CTL_DEL, watcher->fd, NULL);
+            free(watcher_data);
+            pd_set_system_error(loop, pd_get_current_system_error());
+            return PD_ERR_NO_MEMORY;
+        }
+        data->registrations = grown;
+        data->registration_capacity = new_cap;
+    }
+    data->registrations[data->registration_count].fd = watcher->fd;
+    data->registrations[data->registration_count].watcher = watcher;
+    data->registration_count++;
 
     watcher->platform_data = watcher_data;
     return PD_OK;
@@ -340,15 +397,39 @@ static int epoll_watcher_unregister(pd_watcher_t *watcher) {
 
     pd_epoll_data_t *data = (pd_epoll_data_t *)watcher->loop->platform_data;
     if (!data) {
+        /* Loop's platform data is gone; drop the platform data record if the
+           watcher still carries one. */
+        free(watcher->platform_data);
+        watcher->platform_data = NULL;
         return PD_ERR_LOOP_CLOSED;
     }
 
-    /* Remove from epoll */
-    int result = epoll_ctl(data->epoll_fd, EPOLL_CTL_DEL, watcher->fd, NULL);
-    if (result < 0 && errno != EBADF) {
-        /* EBADF is OK, fd was closed */
-        pd_set_system_error(watcher->loop, pd_get_current_system_error());
-        return PD_ERR_SYSTEM;
+    /* Only DEL when this watcher still owns its fd's registration. A stale
+       watcher (its fd was closed and the number recycled to a new watcher,
+       or its registration was already evicted/re-recorded) must NOT delete
+       the current owner's membership — that is how a deferred teardown left
+       an accepted connection permanently unread (OFFS-246). */
+    size_t registration_index = data->registration_count;
+    for (size_t i = 0; i < data->registration_count; i++) {
+        if (data->registrations[i].watcher == watcher) {
+            registration_index = i;
+            break;
+        }
+    }
+
+    if (registration_index < data->registration_count) {
+        /* Remove from epoll */
+        int result = epoll_ctl(data->epoll_fd, EPOLL_CTL_DEL,
+                               watcher->fd, NULL);
+        if (result < 0 && errno != EBADF) {
+            /* EBADF is OK, fd was closed */
+            pd_set_system_error(watcher->loop, pd_get_current_system_error());
+            return PD_ERR_SYSTEM;
+        }
+
+        data->registrations[registration_index] =
+            data->registrations[data->registration_count - 1];
+        data->registration_count--;
     }
 
     /* Free watcher platform data */
