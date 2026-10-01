@@ -122,6 +122,51 @@ For large reads, you may need to implement custom buffering.
 - **Windows**: Call `WSACleanup()` before process exit
 - **Unix**: No special cleanup needed
 
+### Timer Destroy Contract
+The `timer_destroy` op returns an int, not void:
+
+- **1** — no loop thread can still reach this timer; `pd_timer_destroy` may
+  free the `pd_timer_t` struct. epoll and kqueue always return 1: timers
+  dispatch synchronously off the fd/kevent, so no queued completion can
+  outlive destroy.
+- **0** — a queued completion may still be pending (Windows/IOCP when
+  `iocp_drain_sync` times out). The completion's `lpOverlapped` IS the
+  `pd_timer_t*`, and the dispatcher dereferences `timer->platform_data` and
+  `td->destroyed` on it — so the struct and its `platform_data` must leak
+  instead of being freed. The dispatcher reads `td->destroyed` and skips the
+  dead timer either way. A leak is recoverable; a use-after-free is not.
+
+Callers that hold their own locks must also never hold them across
+`pd_timer_stop`/`pd_timer_destroy`: on Windows these wait for the loop thread
+(`iocp_drain_sync`, 5 s timeout), and holding a lock the loop thread needs is
+a circular wait (this exact shape caused the timer-actor stall documented in
+the liboffs docs, `backpressure-and-timer-stall.md`).
+
+### Watcher Unregister Ownership
+
+On epoll and kqueue, `watcher_unregister` deletes the kernel membership for a
+fd/ident **by number**. That is only safe while the unregistering watcher is
+still its ident's current registration: a watcher whose fd was closed and
+whose number the kernel recycled for a new file — for example a server's
+accepted connection after a client reconnects quickly — must not delete the
+NEW owner's registration, or the new file is silently removed from the event
+loop and never read again (observed as the liboffs/OFFS daemon's accepted CLI
+connections going permanently unread; the deferred-teardown destroy stacks
+amplify the window because the DEL lands long after the fd was reused).
+
+Both backends therefore keep a record of live registrations
+(`{ident, watcher}` in the loop's platform data):
+
+- `watcher_register` evicts any record naming the same ident held by a
+  DIFFERENT watcher (the kernel-side membership the stale record described is
+  already gone — it dies with the fd's last reference) and records the new
+  one.
+- `watcher_unregister` only issues the DEL when ITS watcher still holds the
+  ident's record; otherwise it skips the kernel delete and just releases the
+  watcher's platform data.
+- IOCP is handle-based (completion keyed by lpOverlapped, not by fd number)
+  and does not record registrations.
+
 ## Platform Detection
 
 The library automatically detects the platform at compile time:

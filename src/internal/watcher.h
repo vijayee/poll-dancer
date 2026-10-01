@@ -17,9 +17,18 @@ extern "C" {
 
 /**
  * Internal watcher structure.
+ *
+ * The watcher can monitor either an OS file descriptor (`fd`) or a native
+ * Windows HANDLE (`handle`). On POSIX builds only `fd` is meaningful. On
+ * Windows, callers that obtained the resource as a HANDLE (e.g. a named
+ * pipe) use `pd_watcher_create_for_handle`; callers with a CRT file
+ * descriptor continue to use `pd_watcher_create` which stores the fd and
+ * resolves it to a HANDLE on demand.
  */
 struct pd_watcher {
     int fd;                        /**< File descriptor being watched */
+    void *handle;                  /**< Native handle (Windows HANDLE), or NULL */
+    int is_handle;                 /**< Non-zero if `handle` is the watched resource */
     pd_event_t events;            /**< Events being monitored */
     pd_callback_t callback;       /**< Callback function */
     void *user_data;              /**< User data for callback */

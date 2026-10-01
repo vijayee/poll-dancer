@@ -115,6 +115,30 @@ pd_watcher_t *pd_watcher_create(pd_loop_t *loop,
                                  void *user_data);
 
 /**
+ * Create a new watcher for a native Windows HANDLE.
+ *
+ * Use this when the resource to monitor is a Windows HANDLE (e.g. a named
+ * pipe) rather than a CRT file descriptor. On POSIX builds this is not
+ * meaningful and returns NULL.
+ *
+ * The handle must remain valid for the lifetime of the watcher. The
+ * watcher does not take ownership of the handle; the caller is responsible
+ * for closing it after destroying the watcher.
+ *
+ * @param loop The loop to attach the watcher to
+ * @param handle The native handle to monitor (e.g. a Windows HANDLE)
+ * @param events The events to monitor (combination of pd_event_t values)
+ * @param callback The callback to invoke when events occur
+ * @param user_data User data to pass to the callback
+ * @return A new watcher handle, or NULL on error
+ */
+pd_watcher_t *pd_watcher_create_for_handle(pd_loop_t *loop,
+                                            void *handle,
+                                            pd_event_t events,
+                                            pd_callback_t callback,
+                                            void *user_data);
+
+/**
  * Update the events monitored by a watcher.
  *
  * @param watcher The watcher to update
@@ -163,6 +187,28 @@ int pd_watcher_get_fd(pd_watcher_t *watcher);
  * @return The events, or PD_EVENT_NONE if the watcher is invalid
  */
 pd_event_t pd_watcher_get_events(pd_watcher_t *watcher);
+
+/**
+ * Drain the most recent read completion's data from a watcher.
+ *
+ * On Windows IOCP (the only backend that completes a read into a
+ * library-owned buffer), this copies up to `len` bytes from the last
+ * completed ReadFile/WSARecv into `buf` and returns the number of
+ * bytes copied. After this call the internal buffer is reset and the
+ * backend re-issues the async read so the next completion can fire.
+ *
+ * On POSIX backends the IOCP buffer is empty and this returns 0; the
+ * caller should fall back to its own synchronous recv() call.
+ *
+ * This function is only meaningful inside a PD_EVENT_READ callback.
+ * Calling it from any other context returns 0.
+ *
+ * @param watcher The watcher
+ * @param buf Output buffer for the drained data (caller-owned)
+ * @param len Capacity of buf
+ * @return Number of bytes copied into buf, 0 if no data is pending
+ */
+size_t pd_watcher_drain_read(pd_watcher_t *watcher, void *buf, size_t len);
 
 /* ============================================================================
  * Timer Management

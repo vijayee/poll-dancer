@@ -8,7 +8,6 @@
 #include "poll-dancer/errors.h"
 #include "internal/internal.h"
 #include "internal/loop.h"
-#include "internal/loop.h"
 
 #include <string.h>
 #include <errno.h>
@@ -62,7 +61,14 @@ const char *pd_get_system_error_string(pd_loop_t *loop) {
     }
 
 #ifdef PD_PLATFORM_WINDOWS
-    static __thread char buffer[256];
+    /* MSVC's C compiler does not support the __thread keyword; use the
+     * __declspec(thread) storage-class specifier instead. GCC/Clang accept
+     * __thread on all targets supported here. */
+    #if defined(_MSC_VER)
+        static __declspec(thread) char buffer[256];
+    #else
+        static __thread char buffer[256];
+    #endif
     FormatMessageA(
         FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         NULL,

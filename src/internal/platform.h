@@ -30,8 +30,13 @@ typedef struct pd_platform_ops {
 
     /* Watcher operations */
     int (*watcher_register)(struct pd_loop *loop, struct pd_watcher *watcher);
+    int (*watcher_register_handle)(struct pd_loop *loop, struct pd_watcher *watcher);
     int (*watcher_update)(struct pd_watcher *watcher, pd_event_t events);
     int (*watcher_unregister)(struct pd_watcher *watcher);
+    /* Drain bytes from the watcher's last completed read into `buf`.
+     * Only the IOCP backend implements this; POSIX backends return 0
+     * and the caller falls back to its own synchronous recv(). */
+    size_t (*watcher_drain_read)(struct pd_watcher *watcher, void *buf, size_t len);
 
     /* Async operations */
     int (*async_send)(struct pd_loop *loop, void *data);
@@ -40,7 +45,13 @@ typedef struct pd_platform_ops {
     int (*timer_create)(struct pd_loop *loop, struct pd_timer *timer);
     int (*timer_start)(struct pd_timer *timer);
     int (*timer_stop)(struct pd_timer *timer);
-    void (*timer_destroy)(struct pd_timer *timer);
+    /* Tear the timer's platform resources down. Returns 1 when no loop
+     * thread can still reach this timer (the normal case) and pd_timer_destroy
+     * may free the pd_timer_t struct; returns 0 when a queued completion may
+     * still be pending on the loop — the loop thread dereferences lpOverlapped
+     * (the pd_timer_t*) and timer->platform_data in its dispatcher — so the
+     * struct and its platform_data must leak instead of being freed. */
+    int (*timer_destroy)(struct pd_timer *timer);
 
     /* Platform info */
     const char *name;       /**< Platform name (e.g., "epoll", "kqueue", "iocp") */

@@ -117,11 +117,18 @@ pd_error_t pd_timer_destroy(pd_timer_t *timer) {
         timer->watcher = NULL;
     }
 
-    /* Call platform-specific timer destroy */
+    /* Call platform-specific timer destroy. On a backend whose loop can
+     * still hold a queued completion for this timer (IOCP: the completion's
+     * lpOverlapped IS the pd_timer_t*), the backend returns 0 when its drain
+     * barrier failed and the loop thread may still dereference this struct —
+     * in that case the struct leaks deliberately (leak over use-after-free). */
+    int safe_to_free = 1;
     if (timer->loop && timer->loop->ops && timer->loop->ops->timer_destroy) {
-        timer->loop->ops->timer_destroy(timer);
+        safe_to_free = timer->loop->ops->timer_destroy(timer);
     }
 
-    free(timer);
+    if (safe_to_free) {
+        free(timer);
+    }
     return PD_OK;
 }

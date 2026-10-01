@@ -31,11 +31,26 @@ static const int pd_async_ident;
 /**
  * Platform-specific data for kqueue.
  */
+/**
+ * One live registration: the watcher that currently owns a given ident in
+ * this loop's kqueue. Unregistration consults it by WATCHER IDENTITY, not
+ * ident value — a watcher torn down after its fd was closed and recycled by
+ * a new connection must not delete the new owner's filters (see
+ * docs/PLATFORM.md, Watcher Unregister Ownership).
+ */
+typedef struct {
+    int ident;
+    pd_watcher_t *watcher;
+} pd_kqueue_registration_t;
+
 typedef struct {
     int kqueue_fd;                   /**< kqueue file descriptor */
     struct kevent *events;           /**< Event array for kevent */
     int max_events;                  /**< Maximum events per wait */
     uintptr_t async_ident;           /**< Identifier for the EVFILT_USER async event */
+    pd_kqueue_registration_t *registrations;  /**< Live ident -> watcher registrations */
+    size_t registration_count;
+    size_t registration_capacity;
 } pd_kqueue_data_t;
 
 /**
@@ -52,13 +67,25 @@ static void kqueue_loop_destroy(pd_loop_t *loop);
 static int kqueue_loop_run(pd_loop_t *loop, int timeout_ms);
 static int kqueue_loop_stop(pd_loop_t *loop);
 static int kqueue_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher);
+static int kqueue_watcher_register_handle_unused(pd_loop_t *loop, pd_watcher_t *watcher);
 static int kqueue_watcher_update(pd_watcher_t *watcher, pd_event_t events);
 static int kqueue_watcher_unregister(pd_watcher_t *watcher);
 static int kqueue_async_send(pd_loop_t *loop, void *data);
 static int kqueue_timer_create(pd_loop_t *loop, pd_timer_t *timer);
 static int kqueue_timer_start(pd_timer_t *timer);
 static int kqueue_timer_stop(pd_timer_t *timer);
-static void kqueue_timer_destroy(pd_timer_t *timer);
+static int kqueue_timer_destroy(pd_timer_t *timer);
+
+/**
+ * HANDLE-based watcher registration is a Windows-only feature. On POSIX
+ * builds this slot is a stub that returns PD_ERR_NOT_IMPLEMENTED so the
+ * vtable is fully populated.
+ */
+static int kqueue_watcher_register_handle_unused(pd_loop_t *loop, pd_watcher_t *watcher) {
+    (void)loop;
+    (void)watcher;
+    return PD_ERR_NOT_IMPLEMENTED;
+}
 
 /* Platform operations */
 const pd_platform_ops_t pd_platform_kqueue = {
@@ -67,8 +94,10 @@ const pd_platform_ops_t pd_platform_kqueue = {
     .loop_run = kqueue_loop_run,
     .loop_stop = kqueue_loop_stop,
     .watcher_register = kqueue_watcher_register,
+    .watcher_register_handle = kqueue_watcher_register_handle_unused,
     .watcher_update = kqueue_watcher_update,
     .watcher_unregister = kqueue_watcher_unregister,
+    .watcher_drain_read = NULL, /* kqueue: caller does its own recv() */
     .async_send = kqueue_async_send,
     .timer_create = kqueue_timer_create,
     .timer_start = kqueue_timer_start,
@@ -151,6 +180,7 @@ static void kqueue_loop_destroy(pd_loop_t *loop) {
     }
 
     free(data->events);
+    free(data->registrations);
     free(data);
     loop->platform_data = NULL;
 }
@@ -271,6 +301,19 @@ static int kqueue_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
         return PD_ERR_NO_MEMORY;
     }
 
+    /* A previous watcher of this (possibly recycled) ident may still hold a
+       registration record; evict it so our own record is the ident's only
+       one. The kernel-side filters it describes are already gone (kqueue
+       membership dies with the fd's last reference). */
+    for (size_t i = 0; i < data->registration_count; i++) {
+        if (data->registrations[i].ident == watcher->fd &&
+            data->registrations[i].watcher != watcher) {
+            data->registrations[i] = data->registrations[data->registration_count - 1];
+            data->registration_count--;
+            break;
+        }
+    }
+
     /* Set up read filter if requested */
     if (watcher->events & PD_EVENT_READ) {
         EV_SET(&watcher_data->kev_read, watcher->fd, EVFILT_READ,
@@ -304,6 +347,32 @@ static int kqueue_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
             return PD_ERR_SYSTEM;
         }
     }
+
+    /* Record the registration */
+    if (data->registration_count >= data->registration_capacity) {
+        size_t new_cap = data->registration_capacity == 0
+            ? 8 : data->registration_capacity * 2;
+        pd_kqueue_registration_t *grown =
+            realloc(data->registrations, new_cap * sizeof(pd_kqueue_registration_t));
+        if (!grown) {
+            /* Cannot track the registration — undo the kernel-side filters so
+               the watcher is simply unusable rather than half-armed. */
+            if (nchanges > 0) {
+                for (int i = 0; i < nchanges; i++) {
+                    changes[i].flags = EV_DELETE;
+                }
+                kevent(data->kqueue_fd, changes, nchanges, NULL, 0, NULL);
+            }
+            free(watcher_data);
+            pd_set_system_error(loop, pd_get_current_system_error());
+            return PD_ERR_NO_MEMORY;
+        }
+        data->registrations = grown;
+        data->registration_capacity = new_cap;
+    }
+    data->registrations[data->registration_count].ident = watcher->fd;
+    data->registrations[data->registration_count].watcher = watcher;
+    data->registration_count++;
 
     watcher->platform_data = watcher_data;
     return PD_OK;
@@ -400,22 +469,41 @@ static int kqueue_watcher_unregister(pd_watcher_t *watcher) {
         return PD_ERR_INVALID_ARG;
     }
 
-    /* Delete filters from kqueue */
-    struct kevent changes[2];
-    int nchanges = 0;
-
-    if (watcher->events & PD_EVENT_READ) {
-        EV_SET(&changes[nchanges], watcher->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        nchanges++;
+    /* Only delete filters when this watcher still owns its ident's
+       registration. A stale watcher (its fd was closed and the number
+       recycled to a new watcher, or its record was evicted) must NOT delete
+       the current owner's filters — a deferred teardown would otherwise leave
+       an accepted connection permanently unread (OFFS-246). */
+    size_t registration_index = data->registration_count;
+    for (size_t i = 0; i < data->registration_count; i++) {
+        if (data->registrations[i].watcher == watcher) {
+            registration_index = i;
+            break;
+        }
     }
-    if (watcher->events & PD_EVENT_WRITE) {
-        EV_SET(&changes[nchanges], watcher->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-        nchanges++;
-    }
 
-    if (nchanges > 0) {
-        /* Ignore errors, fd might have been closed */
-        kevent(data->kqueue_fd, changes, nchanges, NULL, 0, NULL);
+    if (registration_index < data->registration_count) {
+        /* Delete filters from kqueue */
+        struct kevent changes[2];
+        int nchanges = 0;
+
+        if (watcher->events & PD_EVENT_READ) {
+            EV_SET(&changes[nchanges], watcher->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            nchanges++;
+        }
+        if (watcher->events & PD_EVENT_WRITE) {
+            EV_SET(&changes[nchanges], watcher->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+            nchanges++;
+        }
+
+        if (nchanges > 0) {
+            /* Ignore errors, fd might have been closed */
+            kevent(data->kqueue_fd, changes, nchanges, NULL, 0, NULL);
+        }
+
+        data->registrations[registration_index] =
+            data->registrations[data->registration_count - 1];
+        data->registration_count--;
     }
 
     /* Free watcher platform data */
@@ -599,9 +687,9 @@ static int kqueue_timer_stop(pd_timer_t *timer) {
     return PD_OK;
 }
 
-static void kqueue_timer_destroy(pd_timer_t *timer) {
+static int kqueue_timer_destroy(pd_timer_t *timer) {
     if (!timer) {
-        return;
+        return 1;
     }
 
     /* Free platform data */
@@ -620,4 +708,7 @@ static void kqueue_timer_destroy(pd_timer_t *timer) {
         free(timer->watcher);
         timer->watcher = NULL;
     }
+    /* kqueue dispatches timers via EV_DELETE'd kevents; nothing queued can
+     * outlive destroy, so the struct is always safe to free. */
+    return 1;
 }
