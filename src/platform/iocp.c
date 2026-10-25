@@ -470,6 +470,10 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
             !watcher_data->stopping) {
             DWORD bytes_read = 0;
             memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
+            /* PUBLISH intent before the re-issue: an instantly-ready
+            read (bytes still queued) can complete before the flag
+            posts below, dead-arming this connection. */
+            watcher_data->pending_operation = 1;
             int issued_ok = 0;
             if (watcher->is_handle) {
                 /* ReadFile on an overlapped handle returns FALSE with
@@ -505,8 +509,8 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
                 );
                 issued_ok = (rc == 0) || (rc == SOCKET_ERROR && WSAGetLastError() == WSA_IO_PENDING);
             }
-            if (issued_ok) {
-                watcher_data->pending_operation = 1;
+            if (!issued_ok) {
+                watcher_data->pending_operation = 0;
             }
             /* On error, leave pending_operation = 0; pd_watcher_update
              * can re-issue. */
@@ -616,9 +620,19 @@ static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
 
     if (result == NULL) {
         pd_set_system_error(loop, GetLastError());
+        watcher->platform_data = NULL;
         free(watcher_data);
         return PD_ERR_SYSTEM;
     }
+
+    /* PUBLISH the watcher's platform data BEFORE arming the async read:
+       a socket whose read completes instantly (bytes already queued -
+       the CLI's auth + command frames waiting in the pipe) posts its
+       completion into the IOCP before the handler can find its data,
+       dead-arming the read for that connection's lifetime. The
+       original CacheGcWireSweep hunt fix (mode A) was lost in an
+       uncommitted working tree; re-applied and committed here. */
+    watcher->platform_data = watcher_data;
 
     /* For READ monitoring, issue an async read */
     if (watcher->events & PD_EVENT_READ) {
@@ -646,7 +660,7 @@ static int iocp_watcher_register(pd_loop_t *loop, pd_watcher_t *watcher) {
         watcher_data->pending_operation = 1;  /* Read pending */
     }
 
-    watcher->platform_data = watcher_data;
+    /* platform_data already published above the arm. */
     return PD_OK;
 }
 
@@ -706,6 +720,12 @@ static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events) {
         DWORD bytes_received = 0;
         memset(&watcher_data->overlapped, 0, sizeof(OVERLAPPED));
 
+        /* PUBLISH intent FIRST: the re-armed read of an instantly-ready
+        handle (bytes queued) can complete before the line below runs;
+        the completion must find pending_operation already published,
+        or the read dead-arms for the connection's lifetime. */
+        watcher_data->pending_operation = 1;
+
         int issued_ok = 0;
         if (watcher->is_handle && watcher->handle &&
                 watcher->handle != INVALID_HANDLE_VALUE) {
@@ -749,8 +769,9 @@ static int iocp_watcher_update(pd_watcher_t *watcher, pd_event_t events) {
             }
         }
 
-        if (issued_ok) {
-            watcher_data->pending_operation = 1;
+        if (!issued_ok) {
+            /* the re-issue did not arm: retract the published intent */
+            watcher_data->pending_operation = 0;
         }
     }
 
