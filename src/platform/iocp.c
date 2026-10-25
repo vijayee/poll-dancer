@@ -381,6 +381,26 @@ static int iocp_loop_run(pd_loop_t *loop, int timeout_ms) {
             continue;
         }
 
+        /* platform_data gone - the watcher is torn down. A completion can
+         * still be queued for this watcher with an lpOverlapped that points
+         * INTO the freed watcher_data: unregister's synchronous free
+         * (pending==0) does not drain a client-issued write completion the
+         * FIFO already holds, and a write completion can consume the
+         * stopping-check's deferred free ahead of the canceled read
+         * completion queued behind it (same batch, same FIFO). The cancel
+         * filter below reads lpOverlapped->Internal unconditionally, so
+         * reaching it with a dangling overlapped is the c0000005 read of a
+         * decommitted page-heap block that crashed the daemon's pipe loop
+         * thread. Nothing deliverable remains anyway: with platform_data
+         * NULL the watcher has no read state and no live backend - drop the
+         * completion untouched. A client write waiting on its own overlapped
+         * still completes (its event is signaled by the kernel either way);
+         * it only loses this WRITE callback, exactly as the stopping-check
+         * drop documented above. */
+        if (write_wd == NULL) {
+            continue;
+        }
+
         /* Check whether the I/O was cancelled (CancelIoEx, pipe close,
          * etc.) before reaching the user. Only read completions reach here:
          * client-issued write completions are handled by the demux above. A
