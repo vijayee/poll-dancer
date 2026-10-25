@@ -366,6 +366,77 @@ TEST_F(IocpTest, WriteCompletionDelivered) {
     pd_loop_destroy(loop);
 }
 
+/* Test: teardown completions with a dangling lpOverlapped are dropped.
+ *
+ * The write-demux only takes its PD_EVENT_WRITE branch when
+ * watcher->platform_data is non-NULL. When platform_data is NULL (already
+ * freed), a still-queued completion for this watcher - a caller-issued
+ * overlapped WRITE completion, or the canceled read queued BEHIND it - must
+ * NOT fall through to the cancel filter, which reads
+ * entry->lpOverlapped->Internal unconditionally: with platform_data gone that
+ * overlapped points into the freed watcher_data, and the read is the
+ * c0000005 use-after-free that crashed the daemon's pipe loop thread (page
+ * heap: read of a decommitted block at the freed watcher_data).
+ *
+ * Deterministic reproduction (no thread race): the client-issued write
+ * completion is queued FIRST; destroying the watcher from this thread while
+ * the registration read is pending sets `stopping` and defers the free via
+ * CancelIoEx; the FIFO then delivers [write-done, canceled-read]. The
+ * stopping-check consumes the SECOND entry's platform_data pointer (it frees
+ * on the first), so the second entry reaches the old fall-through with
+ * platform_data NULL and the dangling lpOverlapped.
+ *
+ * Built under ASan this read is caught deterministically (heap-use-after-free
+ * on the freed watcher_data); without ASan the freed bytes are read as
+ * garbage - which must still not reach the user callback, asserted via the
+ * empty event log after teardown. */
+TEST_F(IocpTest, TeardownDropsCompletionWithDanglingOverlapped) {
+    pd_loop_t *loop = pd_loop_create(nullptr);
+    ASSERT_NE(loop, nullptr);
+
+    HANDLE cli = INVALID_HANDLE_VALUE, srv = INVALID_HANDLE_VALUE;
+    ASSERT_NO_FATAL_FAILURE(make_pipe_pair(&cli, &srv));
+
+    CallbackLog log;
+    pd_watcher_t *watcher = pd_watcher_create_for_handle(
+        loop, (void *)cli, static_cast<pd_event_t>(PD_EVENT_READ | PD_EVENT_WRITE),
+        logging_callback, &log);
+    ASSERT_NE(watcher, nullptr);
+
+    std::thread loop_thread([&] { pd_loop_run(loop); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    /* Queue the caller-issued overlapped write completion FIRST.
+     * The registration ReadFile is still pending (no data was written by
+     * the peer), so the watcher has a read in flight below. */
+    const char msg[] = "overlapped-write";
+    OVERLAPPED wov = {};
+    DWORD written = 0;
+    BOOL ok = WriteFile(cli, msg, (DWORD)(sizeof(msg) - 1), &written, &wov);
+    ASSERT_TRUE(ok || GetLastError() == ERROR_IO_PENDING)
+        << "WriteFile err=" << GetLastError();
+
+    /* Destroy the watcher while the read is pending: stopping + CancelIoEx + 
+     * drain_sync; by the time it returns, all queued completions for this
+     * watcher - including the canceled read queued after the write - have been
+     * processed by the loop. */
+    pd_watcher_destroy(watcher);
+
+    /* Nothing from this watcher may be delivered after teardown; under the
+     * old fall-through the freed watcher_data's lpOverlapped content was read
+     * as `io_error` and could surface as bogus ERROR/HANGUP events (and under
+     * page heap/ASan, the read faults). */
+    EXPECT_TRUE(log.snapshot().empty())
+        << "events leaked past teardown: " << log.snapshot().size();
+
+    pd_loop_stop(loop);
+    loop_thread.join();
+
+    CloseHandle(cli);
+    CloseHandle(srv);
+    pd_loop_destroy(loop);
+}
+
 /* Test: WSASend-on-Winsock-SOCKET variant of WriteCompletionDelivered. This
  * gates the offs_client AF_UNIX/TCP overlapped write path: the recv-thread loop
  * binds the transport SOCKET to its IOCP port via pd_watcher_create (which
